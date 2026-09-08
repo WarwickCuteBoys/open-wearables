@@ -49,6 +49,7 @@ class GoogleHealth247Data(Base247DataTemplate):
     # rollUp enforces windowSize * pageSize <= the data type's max range; list default page.
     MAX_PAGE_SIZE = 10_000
     LIST_PAGE_SIZE = 1_000
+    RECENT_SLEEP_DAYS = 7
 
     def __init__(self, oauth: BaseOAuthTemplate, connection_repo: UserConnectionRepository, api_base_url: str):
         super().__init__(provider_name="google", api_base_url=api_base_url, oauth=oauth)
@@ -66,13 +67,45 @@ class GoogleHealth247Data(Base247DataTemplate):
         end_time: datetime,
         is_first_sync: bool = False,
     ) -> dict[str, WriteCounts]:
-        """Fetch + persist every registered metric; failures are isolated per metric."""
+        """Persist recent sleep first, then full history; report failures after saving successes."""
+        if start_time > end_time:
+            raise ValueError("start_time must be before or equal to end_time")
+        if start_time == end_time:
+            log_structured(
+                self.logger,
+                "info",
+                "Google 24/7 sync skipped empty window",
+                provider=self.provider_name,
+                task="load_and_save_all",
+                user_id=str(user_id),
+            )
+            return {}
+
         granularity = (
             self.settings_repo.get_data_granularity(db, self.provider_name) or settings.default_data_granularity
         )
         results: dict[str, WriteCounts] = {}
         failures: dict[str, str] = {}
         succeeded = 0
+        sleep_count = 0
+
+        recent_start = max(start_time, end_time - timedelta(days=self.RECENT_SLEEP_DAYS))
+        sleep_windows = [("sleep_recent", recent_start, end_time)]
+        if start_time < recent_start:
+            sleep_windows.append(("sleep_history", start_time, recent_start))
+        for data_type, window_start, window_end in sleep_windows:
+            # Sleep merge-saves commit internally, so a savepoint cannot isolate this
+            # handler. Run it before metrics, with a separate transaction per window.
+            try:
+                count = self.sleep.load_and_save(db, user_id, window_start, window_end)
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                self._log_metric_failure(data_type, user_id, e)
+                failures[data_type] = str(e)
+                continue
+            sleep_count += count
+            succeeded += 1
 
         for metric in METRICS:
             # Confine each metric (fetch + write) to a savepoint so a failed write rolls
@@ -92,21 +125,15 @@ class GoogleHealth247Data(Base247DataTemplate):
             if counts is not None:
                 results[metric.data_type] = counts
 
-        try:
-            sleep_count = self.sleep.load_and_save(db, user_id, start_time, end_time)
-            succeeded += 1
-        except Exception as e:
-            self._log_metric_failure("sleep", user_id, e)
-            failures["sleep"] = str(e)
-            sleep_count = 0
-
-        if results or sleep_count:
+        if results:
             db.commit()
 
-        # Every attempted data type failed (e.g. ACCOUNT_NOT_LINKED) — surface it so the sync
-        # is marked FAILED rather than an empty success. A partial/empty run returns normally.
+        # The caller treats a normal return as success. Preserve successful writes but
+        # surface partial failures too, including an incomplete older sleep window.
         if failures and not succeeded:
             raise RuntimeError(f"All Google 24/7 data types failed: {failures}")
+        if failures:
+            raise RuntimeError(f"Google 24/7 sync partially failed: {failures}")
         log_structured(
             self.logger,
             "info",

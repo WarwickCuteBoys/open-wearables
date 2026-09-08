@@ -42,6 +42,30 @@ The Google Health API is an **aggregation layer**: it surfaces data from *every*
 | **Polling (pull)** | Open Wearables periodically fetches data via the Health API (Celery Beat), driven by the [fetch mode](#data-granularity-and-fetch-modes) below. |
 | **Webhooks (notify-only)** | Google sends a lightweight ping naming the changed `dataType` and time intervals; Open Wearables then fetches the changed data over REST. Requires a project-level [subscriber registration](#webhook-subscriber-registration). |
 
+### Sleep-first historical sync
+
+The 24/7 sync imports and commits sleep from the last seven days of the requested
+range first, clipped to the requested start. It then imports older sleep before
+fetching the full requested range of activity, heart, body, and vital metrics at
+the configured resolution. Recent sleep is therefore queryable without waiting
+for a long raw-metric backfill.
+
+Sleep windows are adjacent and start-inclusive/end-exclusive. A session starting
+at the split belongs only to the recent window; a session crossing it belongs to
+the older window and is imported whole. Requests of seven days or less use one
+sleep window; empty ranges do no work and reversed ranges are rejected. The
+seven-day window is relative to the requested end, including historical-only
+requests, not to the worker's current clock.
+
+Each successful sleep window is committed before proceeding. The existing sleep
+merge service also commits individual sessions, so a later error cannot undo
+those sessions. A failed sleep window rolls back its pending transaction and
+does not prevent other windows or metrics from being attempted. After successful
+writes are committed, any fetch or write failures are logged and raised to the
+sync task, which marks the 24/7 sub-task unsuccessful rather than reporting the
+entire import as successful. The overall sync status still follows the existing
+task's failure/partial-success rules.
+
 ## Data granularity and fetch modes
 
 The Health API exposes the same underlying data through three different operations. Open Wearables picks one per the `DEFAULT_DATA_GRANULARITY` setting, and — at the finest granularity — the `GOOGLE_USE_RECONCILE` flag.
