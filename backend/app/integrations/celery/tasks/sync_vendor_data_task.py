@@ -60,6 +60,7 @@ def sync_vendor_data(
     is_historical: bool = False,
     _skip_linked_fan_out: bool = False,
     _linked_primary_user_id: str | None = None,
+    _google_lock_retry: int = 0,
 ) -> dict[str, Any]:
     """
     Synchronize workout/exercise/activity data from all providers the user is connected to.
@@ -183,9 +184,9 @@ def sync_vendor_data(
                 # If this provider account is shared across OW profiles, only one
                 # should make the API call at a time.  The first to acquire the lock
                 # is primary; concurrent duplicates skip and wait for the fan-out.
-                # Fan-out tasks (_skip_linked_fan_out=True) bypass this check entirely.
+                # Google fan-out also takes the lock: it can overlap a historical pull.
                 shared_token: str = ""
-                if connection.provider_user_id and not _skip_linked_fan_out:
+                if connection.provider_user_id and (not _skip_linked_fan_out or provider_name == "google"):
                     is_pull_primary, shared_token, existing_primary = try_become_primary(
                         provider_name, connection.provider_user_id, user_uuid, scope="pull"
                     )
@@ -210,6 +211,49 @@ def sync_vendor_data(
                             )
 
                     if not is_pull_primary:
+                        if provider_name == "google":
+                            # Historical and live pulls share this lock, even for the same
+                            # profile. A skip cannot advance the live cursor or claim delivery.
+                            if _google_lock_retry < 5:
+                                sync_vendor_data.apply_async(
+                                    kwargs={
+                                        "user_id": user_id,
+                                        "start_date": start_date,
+                                        "end_date": end_date,
+                                        "providers": ["google"],
+                                        "is_historical": is_historical,
+                                        "_google_lock_retry": _google_lock_retry + 1,
+                                        "_skip_linked_fan_out": _skip_linked_fan_out,
+                                        "_linked_primary_user_id": _linked_primary_user_id,
+                                    },
+                                    countdown=min(60 * (2**_google_lock_retry), 900),
+                                )
+                            message = (
+                                "Google pull deferred behind an active pull"
+                                if _google_lock_retry < 5
+                                else "Google pull lock retries exhausted; cursor unchanged"
+                            )
+                            log_structured(
+                                logger,
+                                "warning",
+                                message,
+                                provider=provider_name,
+                                user_id=user_id,
+                                retry=_google_lock_retry,
+                            )
+                            _emit_sync_status(
+                                failed,
+                                user_uuid,
+                                provider_name,
+                                sync_source,
+                                run_id=run_id,
+                                error=message,
+                                message=message,
+                            )
+                            result.providers_synced[provider_name] = ProviderSyncResult(
+                                success=False, params={"deferred": _google_lock_retry < 5, "error": message}
+                            )
+                            continue
                         log_structured(
                             logger,
                             "info",
@@ -396,7 +440,13 @@ def sync_vendor_data(
                             )
                             provider_result.params["data_247"] = {"success": False, "error": str(e)}
 
-                    if not is_historical:
+                    google_incomplete = provider_name == "google" and any(
+                        isinstance(part, dict) and part.get("success") is False
+                        for part in provider_result.params.values()
+                    )
+                    if google_incomplete:
+                        provider_result.success = False
+                    if not is_historical and not google_incomplete:
                         user_connection_repo.update_last_synced_at(db, connection)
 
                     if shared_token and connection.provider_user_id:
@@ -405,8 +455,12 @@ def sync_vendor_data(
                         )
                         # Fan-out: trigger sync for every other OW profile sharing this
                         # provider account so they receive the same data.
-                        linked_connections = user_connection_repo.get_all_by_provider_user_id(
-                            db, provider_name, connection.provider_user_id
+                        linked_connections = (
+                            user_connection_repo.get_all_by_provider_user_id(
+                                db, provider_name, connection.provider_user_id
+                            )
+                            if not _skip_linked_fan_out
+                            else []
                         )
                         for linked_conn in linked_connections:
                             if linked_conn.user_id == user_uuid:

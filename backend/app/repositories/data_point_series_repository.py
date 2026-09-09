@@ -3,7 +3,21 @@ from datetime import datetime, time, timedelta
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
-from sqlalchemy import ColumnElement, Date, Interval, String, and_, asc, case, cast, func, literal_column, text, tuple_
+from sqlalchemy import (
+    ColumnElement,
+    Date,
+    Interval,
+    String,
+    and_,
+    asc,
+    case,
+    cast,
+    func,
+    literal_column,
+    or_,
+    text,
+    tuple_,
+)
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError as SQLAIntegrityError
 
@@ -63,8 +77,8 @@ class DataPointSeriesRepository(
 
     # PostgreSQL/psycopg cap of 65535 bind params per query. Derive the row chunk
     # from the column count in _insert_data_points so adding a column can't silently
-    # push a full chunk over the limit (8 cols -> 8191 rows).
-    _INSERT_COLUMNS_PER_ROW = 8
+    # push a full chunk over the limit.
+    _INSERT_COLUMNS_PER_ROW = 14
     BATCH_INSERT_CHUNK_SIZE = 65_535 // _INSERT_COLUMNS_PER_ROW
 
     def __init__(self, model: type[DataPointSeries]):
@@ -181,6 +195,12 @@ class DataPointSeriesRepository(
                     "data_source_id": source_id,
                     "recorded_at": creator.recorded_at,
                     "zone_offset": creator.zone_offset,
+                    "interval_end": creator.interval_end,
+                    "end_zone_offset": creator.end_zone_offset,
+                    "source_type": creator.source_type,
+                    "ingestion_version": creator.ingestion_version,
+                    "coverage_known": creator.coverage_known,
+                    "ingested_at": creator.ingested_at,
                     "value": creator.value,
                     "series_type_definition_id": get_series_type_id(creator.series_type),
                     "is_daily_total": creator.is_daily_total,
@@ -208,6 +228,12 @@ class DataPointSeriesRepository(
                         "external_id": stmt.excluded.external_id,
                         "zone_offset": stmt.excluded.zone_offset,
                         "is_daily_total": stmt.excluded.is_daily_total,
+                        "interval_end": stmt.excluded.interval_end,
+                        "end_zone_offset": stmt.excluded.end_zone_offset,
+                        "source_type": stmt.excluded.source_type,
+                        "ingestion_version": stmt.excluded.ingestion_version,
+                        "coverage_known": stmt.excluded.coverage_known,
+                        "ingested_at": stmt.excluded.ingested_at,
                     },
                     # RETURNING (xmax = 0): true = row freshly inserted, false = hit a
                     # conflict and was updated in place. Same statement, no extra round-trip.
@@ -503,6 +529,7 @@ class DataPointSeriesRepository(
         user_id: UUID,
         start_date: datetime,
         end_date: datetime,
+        timezone_name: str | None = None,
     ) -> list[ActivityAggregateResult]:
         """Get daily activity aggregates from time-series data.
 
@@ -527,6 +554,8 @@ class DataPointSeriesRepository(
             self.model.recorded_at + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
             Date,
         )
+        if timezone_name:
+            local_date = cast(func.timezone(timezone_name, self.model.recorded_at), Date)
 
         def prefer_daily_sum(series_id: int) -> ColumnElement:
             """Per (day, source): use the daily-total rows if any exist, else sum samples.
@@ -590,6 +619,10 @@ class DataPointSeriesRepository(
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                ~and_(
+                    DataSource.provider == "google",
+                    self.model.series_type_definition_id.in_([energy_id, basal_energy_id]),
+                ),
                 self.model.recorded_at >= start_date - timedelta(days=1),
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
@@ -619,8 +652,8 @@ class DataPointSeriesRepository(
                     "device_model": row.device_model,
                     "device_type": row.device_type,
                     "steps_sum": int(row.steps_sum) if row.steps_sum else 0,
-                    "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum else 0.0,
-                    "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum else 0.0,
+                    "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum is not None else None,
+                    "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum is not None else None,
                     "hr_avg": int(round(float(row.hr_avg))) if row.hr_avg is not None else None,
                     "hr_max": int(row.hr_max) if row.hr_max is not None else None,
                     "hr_min": int(row.hr_min) if row.hr_min is not None else None,
@@ -633,6 +666,28 @@ class DataPointSeriesRepository(
             )
         return aggregates
 
+    def get_google_energy_rows(
+        self, db: DbSession, user_id: UUID, start: datetime, end: datetime
+    ) -> list[tuple[DataPointSeries, DataSource]]:
+        """Fetch exact interval evidence, including records crossing the lower boundary."""
+        ids = [
+            get_series_type_id(t)
+            for t in (SeriesType.energy, SeriesType.active_energy, SeriesType.total_energy, SeriesType.basal_energy)
+        ]
+        rows = (
+            db.query(self.model, DataSource)
+            .join(DataSource, self.model.data_source_id == DataSource.id)
+            .filter(
+                DataSource.user_id == user_id,
+                DataSource.provider == "google",
+                self.model.series_type_definition_id.in_(ids),
+                self.model.recorded_at < end,
+                or_(self.model.interval_end > start, self.model.recorded_at >= start),
+            )
+            .all()
+        )
+        return [(point, source) for point, source in rows]
+
     def get_daily_active_minutes(
         self,
         db_session: DbSession,
@@ -640,6 +695,7 @@ class DataPointSeriesRepository(
         start_date: datetime,
         end_date: datetime,
         active_threshold: int = 30,
+        timezone_name: str | None = None,
     ) -> list[ActiveMinutesResult]:
         """Get daily active/sedentary minutes from step data.
 
@@ -661,6 +717,8 @@ class DataPointSeriesRepository(
             self.model.recorded_at + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
             Date,
         )
+        if timezone_name:
+            local_date = cast(func.timezone(timezone_name, self.model.recorded_at), Date)
 
         # Create minute bucket expression using literal 'minute' text
         minute_trunc = func.date_trunc(literal_column("'minute'"), self.model.recorded_at)
@@ -742,6 +800,7 @@ class DataPointSeriesRepository(
         light_max: int,
         moderate_max: int,
         vigorous_max: int,
+        timezone_name: str | None = None,
     ) -> list[IntensityMinutesResult]:
         """Get daily intensity minutes from heart rate data.
 
@@ -764,6 +823,8 @@ class DataPointSeriesRepository(
             self.model.recorded_at + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
             Date,
         )
+        if timezone_name:
+            local_date = cast(func.timezone(timezone_name, self.model.recorded_at), Date)
 
         # Create minute bucket expression
         minute_trunc = func.date_trunc(literal_column("'minute'"), self.model.recorded_at)

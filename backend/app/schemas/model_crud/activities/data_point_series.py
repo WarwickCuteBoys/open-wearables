@@ -19,6 +19,12 @@ class TimeSeriesSampleBase(BaseModel):
     )
     recorded_at: datetime
     zone_offset: ZoneOffset = None
+    interval_end: datetime | None = None
+    end_zone_offset: ZoneOffset = None
+    source_type: str | None = None
+    ingestion_version: int | None = None
+    coverage_known: bool | None = None
+    ingested_at: datetime | None = None
     value: Decimal | float | int
     series_type: SeriesType
     # True = daily total. False/None = not a daily total (summable sample); aggregation

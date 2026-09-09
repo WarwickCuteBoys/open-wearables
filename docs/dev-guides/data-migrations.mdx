@@ -55,6 +55,12 @@ Once satisfied with the dry-run output, run without the flag:
 docker compose exec app uv run python scripts/data_migrations/<script_name>.py
 ```
 
+**Exception: `repair_google_energy.py` is read-only by default even without
+`--dry-run`.** It requires an explicit user/date/timezone/database scope and
+`--apply --before-state <new-file>` to write. It is never invoked on startup.
+Read its module docstring before use; native provider re-fetch and downstream
+energy invalidation are separate approved operations.
+
 <Warning>
 Scripts write directly to the database. There is no automatic rollback. Take a database snapshot before running against production.
 </Warning>

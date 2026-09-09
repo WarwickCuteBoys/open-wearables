@@ -6,6 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import quote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 if TYPE_CHECKING:
     from app.schemas.enums import ProviderName
@@ -215,6 +216,7 @@ class Settings(BaseSettings):
     # with RAW granularity, either list or reconcile is used
     # true - reconcile, false - list; for details check docs
     google_use_reconcile: bool = True
+    google_energy_calendar_timezone: str | None = None
 
     # EMAIL SETTINGS (Resend)
     resend_api_key: SecretStr | None = None
@@ -327,6 +329,16 @@ class Settings(BaseSettings):
         if self.google_webhook_secret is None or self.google_webhook_secret.get_secret_value() == "":
             self.google_webhook_secret = SecretStr(self.secret_key)
         return self
+
+    @field_validator("google_energy_calendar_timezone")
+    @classmethod
+    def validate_google_energy_calendar_timezone(cls, value: str | None) -> str | None:
+        if value is not None:
+            try:
+                ZoneInfo(value)
+            except (ZoneInfoNotFoundError, ValueError) as exc:
+                raise ValueError("Google energy calendar timezone must be an IANA timezone") from exc
+        return value
 
     @field_validator("cors_origins", mode="after")
     @classmethod

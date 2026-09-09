@@ -4,6 +4,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from logging import Logger, getLogger
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from app.database import DbSession
 from app.models import DataPointSeries, EventRecord, HealthScore, ProviderPriority, User
@@ -40,12 +41,14 @@ from app.schemas.responses.activity import (
     SleepStagesSummary,
     SleepSummary,
 )
+from app.schemas.responses.activity.summaries import EnergyMetadata
 from app.schemas.utils import (
     PaginatedResponse,
     Pagination,
     SourceMetadata,
     TimeseriesMetadata,
 )
+from app.services.energy_summary import google_energy_summaries
 from app.utils.exceptions import handle_exceptions
 from app.utils.pagination import (
     decode_activity_cursor,
@@ -133,7 +136,7 @@ class SummariesService:
                 continue
 
             # Sort by priority
-            def sort_key(entry: dict) -> tuple[int, int, str]:
+            def sort_key(entry: dict) -> tuple[int, int, int, str]:
                 raw_provider = entry.get("provider") or entry.get("source")
                 try:
                     provider = ProviderName(raw_provider)
@@ -149,7 +152,8 @@ class SummariesService:
                     device_type = infer_device_type_from_model(device_model)
                     device_type_priority = device_type_order.get(device_type, 99)
 
-                return (provider_priority, device_type_priority, device_model or "")
+                merged_energy = provider == ProviderName.GOOGLE and "energy_metadata" in entry and not device_model
+                return (provider_priority, 0 if merged_energy else 1, device_type_priority, device_model or "")
 
             entries_sorted = sorted(entries, key=sort_key)
             filtered.append(entries_sorted[0])
@@ -458,6 +462,7 @@ class SummariesService:
         cursor: str | None,
         limit: int,
         sort_order: str = "asc",
+        timezone_name: str | None = None,
     ) -> PaginatedResponse[ActivitySummary]:
         """Get daily activity summaries aggregated by date, provider, and device.
 
@@ -474,18 +479,44 @@ class SummariesService:
         """
         self.logger.debug(f"Fetching activity summaries for user {user_id} from {start_date} to {end_date}")
 
+        if timezone_name:
+            zone = ZoneInfo(timezone_name)
+            # Date-only/naive bounds are civil dates; aware bounds are instants in
+            # the selected zone. SQL and energy accounting must use the same dates.
+            start_day = start_date.astimezone(zone).date() if start_date.tzinfo else start_date.date()
+            end_day = end_date.astimezone(zone).date() if end_date.tzinfo else end_date.date()
+            start_date = datetime.combine(start_day, datetime.min.time(), timezone.utc)
+            end_date = datetime.combine(end_day, datetime.min.time(), timezone.utc)
+
         # Get aggregated data from time-series repository (live data)
-        results = self.data_point_repo.get_daily_activity_aggregates(db_session, user_id, start_date, end_date)
+        results = self.data_point_repo.get_daily_activity_aggregates(
+            db_session, user_id, start_date, end_date, timezone_name=timezone_name
+        )
 
         # Merge archived data when archival is enabled
         results = self._merge_archive_activity(db_session, user_id, start_date, end_date, results)
+
+        energy_rows = self.data_point_repo.get_google_energy_rows(
+            db_session, user_id, start_date - timedelta(days=1), end_date + timedelta(days=1)
+        )
+        energy_results = google_energy_summaries(energy_rows, start_date.date(), end_date.date(), timezone_name)
+        by_key = {(r["activity_date"], r["source"], r.get("device_model")): r for r in results}
+        for energy in energy_results:
+            key = (energy["activity_date"], energy["source"], energy.get("device_model"))
+            if key in by_key:
+                by_key[key].update(energy)
+            else:
+                by_key[key] = energy
+        results = sorted(
+            by_key.values(), key=lambda r: (r["activity_date"], r["source"] or "", r.get("device_model") or "")
+        )
 
         # Filter by priority to get best source per date
         results = self._filter_by_priority(db_session, user_id, results, date_key="activity_date")
 
         # Get workout aggregates (elevation, distance, energy from workouts)
         workout_aggregates = self.event_record_repo.get_daily_workout_aggregates(
-            db_session, user_id, start_date, end_date
+            db_session, user_id, start_date, end_date, timezone_name=timezone_name
         )
 
         # Build lookup dict for workout data by (date, provider, device)
@@ -496,7 +527,12 @@ class SummariesService:
 
         # Get active/sedentary minutes from step data
         activity_minutes = self.data_point_repo.get_daily_active_minutes(
-            db_session, user_id, start_date, end_date, active_threshold=ACTIVE_STEPS_THRESHOLD
+            db_session,
+            user_id,
+            start_date,
+            end_date,
+            active_threshold=ACTIVE_STEPS_THRESHOLD,
+            timezone_name=timezone_name,
         )
 
         # Build lookup for activity minutes
@@ -518,6 +554,7 @@ class SummariesService:
             light_max=hr_zones["light_max"],
             moderate_max=hr_zones["moderate_max"],
             vigorous_max=hr_zones["vigorous_max"],
+            timezone_name=timezone_name,
         )
 
         # Build lookup for intensity minutes
@@ -634,9 +671,13 @@ class SummariesService:
             # not additive - providers report daily totals that include workout calories
             active_cal = result.get("active_energy_sum")
             basal_cal = result.get("basal_energy_sum")
-            total_cal = None
-            if active_cal is not None or basal_cal is not None:
-                total_cal = (active_cal or 0.0) + (basal_cal or 0.0)
+            total_cal = result.get("total_energy_sum")
+            if result.get("provider") == "google":
+                # Archive rows and non-v2 energy must not resurrect the old active alias.
+                if "energy_metadata" not in result:
+                    active_cal = basal_cal = total_cal = None
+            elif active_cal is not None and basal_cal is not None:
+                total_cal = active_cal + basal_cal
 
             # Active minutes: prefer the provider-reported daily active time (Garmin
             # activeTimeInSeconds, Oura high+medium+low activity time, Polar active_duration).
@@ -674,6 +715,8 @@ class SummariesService:
                 elevation_meters=elevation_meters,
                 active_calories_kcal=active_cal,
                 total_calories_kcal=total_cal,
+                basal_calories_kcal=basal_cal,
+                energy_metadata=result.get("energy_metadata") or EnergyMetadata(),
                 active_minutes=active_mins,
                 sedentary_minutes=sedentary_mins,
                 intensity_minutes=intensity_mins,

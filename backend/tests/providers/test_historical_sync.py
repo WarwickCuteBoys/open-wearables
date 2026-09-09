@@ -17,6 +17,7 @@ import pytest
 from app.services.providers.apple.strategy import AppleStrategy
 from app.services.providers.base_strategy import HistoricalSyncResult
 from app.services.providers.garmin.strategy import GarminStrategy
+from app.services.providers.google.strategy import GoogleStrategy
 from app.services.providers.oura.strategy import OuraStrategy
 from app.services.providers.whoop.strategy import WhoopStrategy
 from app.utils.exceptions import UnsupportedProviderError
@@ -101,6 +102,20 @@ class TestPullBasedHistoricalSync:
         start = datetime.fromisoformat(result.start_date)
         end = datetime.fromisoformat(result.end_date)
         assert (end - start).days == 7
+
+    @patch("app.services.providers.base_strategy.celery_app")
+    def test_google_explicit_eight_days_dispatches_without_cancelling(self, mock_celery: MagicMock) -> None:
+        mock_celery.send_task.return_value = MagicMock(id="google-eight-day-task")
+        user_id = uuid4()
+        result = GoogleStrategy().start_historical_sync(user_id, days=8)
+        assert result.days == 8
+        assert (datetime.fromisoformat(result.end_date) - datetime.fromisoformat(result.start_date)).days == 8
+        kwargs = mock_celery.send_task.call_args.kwargs["kwargs"]
+        assert kwargs["user_id"] == str(user_id)
+        assert kwargs["providers"] == ["google"]
+        assert kwargs["is_historical"] is True
+        mock_celery.send_task.assert_called_once()
+        mock_celery.control.revoke.assert_not_called()
 
 
 class TestGarminHistoricalSync:

@@ -1,7 +1,8 @@
 from typing import Annotated
 from uuid import UUID
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from app.database import DbSession
 from app.schemas.responses.activity import (
@@ -29,6 +30,7 @@ def get_activity_summary(
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=400)] = 50,
     sort_order: Annotated[str, Query(pattern="^(asc|desc)$")] = "asc",
+    timezone: Annotated[str | None, Query(description="IANA local-day timezone, e.g. Asia/Bangkok")] = None,
 ) -> PaginatedResponse[ActivitySummary]:
     """Returns daily aggregated activity metrics.
 
@@ -36,8 +38,13 @@ def get_activity_summary(
     """
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_datetime(end_date)
+    if timezone is not None:
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail="timezone must be a valid IANA timezone") from exc
     return summaries_service.get_activity_summaries(
-        db, user_id, start_datetime, end_datetime, cursor, limit, sort_order
+        db, user_id, start_datetime, end_datetime, cursor, limit, sort_order, timezone_name=timezone
     )
 
 

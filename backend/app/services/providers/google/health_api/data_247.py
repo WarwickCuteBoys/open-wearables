@@ -9,10 +9,11 @@ come from the sessions endpoint and are handled separately.
 """
 
 from collections.abc import Iterator
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, NoReturn
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 from app.config import settings
 from app.constants.google_health_endpoints import LIST_ENDPOINT, RECONCILE_ENDPOINT, ROLLUP_ENDPOINT
@@ -23,6 +24,7 @@ from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.enums import GRANULARITY_WINDOW_SECONDS, DataGranularity, SeriesType
 from app.schemas.model_crud.activities import TimeSeriesSampleCreate
 from app.schemas.providers.google import DataTypeMetric, ListSpec, RollupSpec, TimeShape
+from app.services.energy_summary import GOOGLE_CALENDAR_TOTAL_PREFIX, day_bounds
 from app.services.providers.api_client import make_authenticated_request
 from app.services.providers.google.health_api.helpers import (
     GOOGLE_HEALTH_API_SOURCE,
@@ -39,8 +41,11 @@ from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.raw_payload_storage import store_raw_payload
 from app.services.timeseries_service import timeseries_service
+from app.utils.dates import offset_to_iso
 from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
+
+ENERGY_TYPES = frozenset({SeriesType.active_energy, SeriesType.total_energy})
 
 
 class GoogleHealth247Data(Base247DataTemplate):
@@ -79,7 +84,9 @@ class GoogleHealth247Data(Base247DataTemplate):
             # back only that metric and leaves the transaction usable for the rest.
             try:
                 with db.begin_nested():
-                    if metric.use_list(granularity):
+                    if metric.series_type in ENERGY_TYPES:
+                        samples = self._energy_samples(db, user_id, metric, start_time, end_time)
+                    elif metric.use_list(granularity):
                         samples = self._native_samples(db, user_id, metric, start_time, end_time)
                     else:
                         samples = self._rollup_samples(db, user_id, metric, start_time, end_time, granularity)
@@ -107,6 +114,11 @@ class GoogleHealth247Data(Base247DataTemplate):
         # is marked FAILED rather than an empty success. A partial/empty run returns normally.
         if failures and not succeeded:
             raise RuntimeError(f"All Google 24/7 data types failed: {failures}")
+        energy_failures = {
+            key: value for key, value in failures.items() if key in {"active-energy-burned", "total-calories"}
+        }
+        if energy_failures:
+            raise RuntimeError(f"Google energy sync incomplete; successful metrics retained: {energy_failures}")
         log_structured(
             self.logger,
             "info",
@@ -140,7 +152,9 @@ class GoogleHealth247Data(Base247DataTemplate):
         granularity = (
             self.settings_repo.get_data_granularity(db, self.provider_name) or settings.default_data_granularity
         )
-        if metric.use_list(granularity):
+        if metric.series_type in ENERGY_TYPES:
+            samples = self._energy_samples(db, user_id, metric, start_time, end_time)
+        elif metric.use_list(granularity):
             samples = self._native_samples(db, user_id, metric, start_time, end_time)
         else:
             samples = self._rollup_samples(db, user_id, metric, start_time, end_time, granularity)
@@ -149,6 +163,93 @@ class GoogleHealth247Data(Base247DataTemplate):
         counts = timeseries_service.bulk_create_samples(db, samples)
         db.commit()
         return counts
+
+    def _energy_samples(
+        self, db: DbSession, user_id: UUID, metric: DataTypeMetric, start: datetime, end: datetime
+    ) -> list[TimeSeriesSampleCreate]:
+        """Fetch active intervals and canonical total rollups independently of settings.
+
+        The live API rejects total-calories list requests (only rollup/dailyRollup
+        are supported). Fixed UTC hours keep repeated historical/live pulls on the
+        same upsert keys. Rollup bounds are never treated as observed coverage.
+        """
+        if metric.series_type == SeriesType.total_energy:
+            start = start.replace(tzinfo=timezone.utc) if start.tzinfo is None else start.astimezone(timezone.utc)
+            end = end.replace(tzinfo=timezone.utc) if end.tzinfo is None else end.astimezone(timezone.utc)
+            if settings.google_energy_calendar_timezone:
+                return self._calendar_total_samples(
+                    db, user_id, metric, start, end, settings.google_energy_calendar_timezone
+                )
+            low = start.replace(minute=0, second=0, microsecond=0)
+            high = end.replace(minute=0, second=0, microsecond=0)
+            if high < end:
+                high += timedelta(hours=1)
+            high = min(high, datetime.now(timezone.utc))
+            if end <= start or high <= low:
+                raise ValueError("Google energy sync requires a nonempty, nonfuture interval")
+            return self._rollup_samples(db, user_id, metric, low, high, DataGranularity.HOURLY)
+        samples = []
+        for low, high in self._chunk_range(start, end, 14):
+            samples.extend(self._native_samples(db, user_id, metric, low, high))
+        return samples
+
+    def _calendar_total_samples(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        metric: DataTypeMetric,
+        start: datetime,
+        end: datetime,
+        timezone_name: str,
+    ) -> list[TimeSeriesSampleCreate]:
+        """Fetch exact local-day physical rollups; dailyRollUp cannot accept a timezone."""
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        end = min(end, now)
+        if end <= start:
+            raise ValueError("Google energy sync requires a nonempty, nonfuture interval")
+        zone = ZoneInfo(timezone_name)
+        day = start.astimezone(zone).date()
+        last = (end - timedelta(microseconds=1)).astimezone(zone).date()
+        endpoint = ROLLUP_ENDPOINT.format(data_type=metric.data_type)
+        samples = []
+        while day <= last:
+            low, high = day_bounds(day, zone)
+            # Re-fetch an entire closed day even for a webhook naming one changed hour.
+            # Today's endpoint is capped at fetch time, never tomorrow's midnight.
+            high = min(high, now)
+            points = self._fetch_rollup_window(db, user_id, endpoint, low, high, int((high - low).total_seconds()), 1)
+            if len(points) > 1:
+                raise ValueError("Google calendar total returned multiple aggregation windows")
+            for point in points:
+                recorded_at = parse_rfc3339(point.get("startTime"))
+                interval_end = parse_rfc3339(point.get("endTime"))
+                if recorded_at != low or interval_end != high:
+                    raise ValueError("Google calendar total response does not match requested local-day interval")
+                value_obj = point.get(metric.value_key)
+                if not isinstance(value_obj, dict):
+                    continue
+                value = read_number(value_obj, "kcalSum", None, Decimal(1))
+                if value is not None:
+                    start_offset = low.astimezone(zone).utcoffset()
+                    end_offset = high.astimezone(zone).utcoffset()
+                    assert start_offset is not None
+                    assert end_offset is not None
+                    samples.append(
+                        self._sample(
+                            user_id,
+                            low,
+                            value,
+                            SeriesType.total_energy,
+                            True,
+                            offset_to_iso(int(start_offset.total_seconds())),
+                            interval_end=high,
+                            end_zone_offset=offset_to_iso(int(end_offset.total_seconds())),
+                            source_type=f"{GOOGLE_CALENDAR_TOTAL_PREFIX}{timezone_name}",
+                            coverage_known=False,
+                        )
+                    )
+            day += timedelta(days=1)
+        return samples
 
     def _log_metric_failure(self, data_type: str, user_id: UUID, error: Exception) -> None:
         log_and_capture_error(
@@ -192,7 +293,20 @@ class GoogleHealth247Data(Base247DataTemplate):
                 for series_type, field, subfield, scale in self._bindings(metric.series_type, spec):
                     value = read_number(value_obj, field, subfield, scale)
                     if value is not None:
-                        samples.append(self._sample(user_id, recorded_at, value, series_type, is_daily_total))
+                        samples.append(
+                            self._sample(
+                                user_id,
+                                recorded_at,
+                                value,
+                                series_type,
+                                is_daily_total,
+                                zone_offset_from(point.get("startUtcOffset")),
+                                interval_end=parse_rfc3339(point.get("endTime")),
+                                end_zone_offset=zone_offset_from(point.get("endUtcOffset")),
+                                source_type=metric.data_type,
+                                coverage_known=False,
+                            )
+                        )
         return samples
 
     def _fetch_rollup_window(
@@ -235,7 +349,7 @@ class GoogleHealth247Data(Base247DataTemplate):
                 trace_id=endpoint,
             )
             if not isinstance(response, dict):
-                break
+                raise ValueError("Invalid Google rollup response")
             points.extend(response.get("rollupDataPoints", []))
             page_token = response.get("nextPageToken")
             if not page_token:
@@ -274,7 +388,8 @@ class GoogleHealth247Data(Base247DataTemplate):
         spec = metric.list_spec
         if spec is None:
             return []
-        reconcile = settings.google_use_reconcile
+        energy = metric.series_type in ENERGY_TYPES
+        reconcile = metric.series_type == SeriesType.active_energy if energy else settings.google_use_reconcile
         template = RECONCILE_ENDPOINT if reconcile else LIST_ENDPOINT
         endpoint = template.format(data_type=metric.data_type)
         time_filter = self._time_filter(metric.data_type, spec.time, start_time, end_time, spec.session_interval)
@@ -289,13 +404,34 @@ class GoogleHealth247Data(Base247DataTemplate):
             if recorded_at is None or not (start_time <= recorded_at < end_time):
                 continue
             # Only list points carry a dataSource; reconciled points are already merged.
-            device_model = None if reconcile else extract_source(point.get("dataSource"))[1]
+            device_model = None if reconcile or energy else extract_source(point.get("dataSource"))[1]
+            interval = value_obj.get("interval") or value_obj
+            interval_end = parse_rfc3339(interval.get("endTime")) if spec.time == TimeShape.INTERVAL else None
+            if interval_end is not None and interval_end <= recorded_at:
+                raise ValueError(f"Invalid {metric.data_type} interval")
             for series_type, field, subfield, scale in self._bindings(metric.series_type, spec):
                 value = read_number(value_obj, field, subfield, scale)
+                if (
+                    value is None
+                    and field not in value_obj
+                    and metric.data_type in {"steps", "distance"}
+                    and interval_end is not None
+                ):
+                    value = Decimal(0)
                 if value is not None:
                     samples.append(
                         self._sample(
-                            user_id, recorded_at, value, series_type, spec.is_daily_total, zone_offset, device_model
+                            user_id,
+                            recorded_at,
+                            value,
+                            series_type,
+                            spec.is_daily_total,
+                            zone_offset,
+                            device_model,
+                            interval_end=interval_end if energy else None,
+                            end_zone_offset=zone_offset_from(interval.get("endUtcOffset")) if energy else None,
+                            source_type=metric.data_type if energy else None,
+                            coverage_known=interval_end is not None if energy else None,
                         )
                     )
         return samples
@@ -315,7 +451,7 @@ class GoogleHealth247Data(Base247DataTemplate):
         """Resolve a list data point's (timestamp, zone_offset) from its declared record shape."""
         match shape:
             case TimeShape.INTERVAL:
-                interval = point.get("interval") or {}
+                interval = point.get("interval") or point
                 recorded_at = parse_rfc3339(interval.get("startTime") or interval.get("endTime"))
                 return recorded_at, zone_offset_from(interval.get("startUtcOffset"))
             case TimeShape.SAMPLE:
@@ -381,7 +517,7 @@ class GoogleHealth247Data(Base247DataTemplate):
                 trace_id=endpoint,
             )
             if not isinstance(response, dict):
-                break
+                raise ValueError("Invalid Google data points response")
             points.extend(response.get("dataPoints", []))
             page_token = response.get("nextPageToken")
             if not page_token:
@@ -397,6 +533,11 @@ class GoogleHealth247Data(Base247DataTemplate):
         is_daily_total: bool,
         zone_offset: str | None = None,
         device_model: str | None = None,
+        *,
+        interval_end: datetime | None = None,
+        end_zone_offset: str | None = None,
+        source_type: str | None = None,
+        coverage_known: bool | None = None,
     ) -> TimeSeriesSampleCreate:
         return TimeSeriesSampleCreate(
             id=uuid4(),
@@ -406,6 +547,12 @@ class GoogleHealth247Data(Base247DataTemplate):
             device_model=device_model,
             recorded_at=recorded_at,
             zone_offset=zone_offset,
+            interval_end=interval_end,
+            end_zone_offset=end_zone_offset,
+            source_type=source_type,
+            ingestion_version=2 if series_type in ENERGY_TYPES else None,
+            coverage_known=coverage_known,
+            ingested_at=datetime.now(timezone.utc) if series_type in ENERGY_TYPES else None,
             value=value,
             series_type=series_type,
             is_daily_total=is_daily_total,

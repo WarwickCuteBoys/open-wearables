@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
@@ -19,6 +20,46 @@ class HeartRateStats(BaseModel):
     min_bpm: int | None = None
 
 
+class EnergyInterval(BaseModel):
+    start: datetime
+    end: datetime
+
+
+class EnergyCalendarAggregation(BaseModel):
+    """Provider aggregation bounds, not sensor coverage or data finality."""
+
+    kind: Literal["calendar_day"] = "calendar_day"
+    source: Literal["google_total_calories_rollup"] = "google_total_calories_rollup"
+    data_source_family: Literal["all-sources"] = "all-sources"
+    date: date
+    timezone: str
+    interval: EnergyInterval
+    as_of: datetime
+    complete: bool = Field(description="The returned aggregation window exactly spans the completed local day")
+
+
+class EnergyMetricMetadata(BaseModel):
+    coverage: Literal["complete", "partial", "unknown"] = "unknown"
+    estimated: bool = False
+    intervals: list[EnergyInterval] = Field(default_factory=list)
+    timezone: str | None = None
+    as_of: datetime | None = None
+    reason: str | None = None
+    source_type: str | None = None
+    aggregation: EnergyCalendarAggregation | None = None
+
+
+class EnergyMetricsMetadata(BaseModel):
+    active_calories: EnergyMetricMetadata = Field(default_factory=EnergyMetricMetadata)
+    total_calories: EnergyMetricMetadata = Field(default_factory=EnergyMetricMetadata)
+    basal_calories: EnergyMetricMetadata = Field(default_factory=EnergyMetricMetadata)
+
+
+class EnergyMetadata(BaseModel):
+    version: Literal[2] = 2
+    metrics: EnergyMetricsMetadata = Field(default_factory=EnergyMetricsMetadata)
+
+
 class ActivitySummary(BaseModel):
     date: date
     source: SourceMetadata
@@ -31,6 +72,8 @@ class ActivitySummary(BaseModel):
     # Energy metrics
     active_calories_kcal: float | None = Field(None, description="Active energy burned", example=342.5)
     total_calories_kcal: float | None = Field(None, description="Active + basal energy", example=2150.0)
+    basal_calories_kcal: float | None = Field(None, description="Provider-reported basal energy only")
+    energy_metadata: EnergyMetadata = Field(default_factory=EnergyMetadata)
     # Duration metrics (based on step threshold)
     active_minutes: int | None = Field(None, description="Minutes with activity above threshold", example=60)
     sedentary_minutes: int | None = Field(None, description="Minutes with minimal activity", example=480)
