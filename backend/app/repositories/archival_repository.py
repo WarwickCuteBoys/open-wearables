@@ -5,7 +5,7 @@ import uuid
 from datetime import date, datetime, timezone
 from uuid import UUID
 
-from sqlalchemy import Date, case, cast, func, text
+from sqlalchemy import ColumnElement, Date, and_, case, cast, func, text
 from sqlalchemy.dialects.postgresql import insert
 
 from app.database import DbSession
@@ -162,7 +162,10 @@ class DataPointSeriesArchiveRepository:
             # Step 1: Find data_source_ids with archivable data (batch by source)
             source_ids = (
                 db.query(DataPointSeries.data_source_id)
-                .filter(cast(DataPointSeries.recorded_at, Date) < cutoff_date)
+                .filter(
+                    cast(DataPointSeries.recorded_at, Date) < cutoff_date,
+                    self._interval_safe_to_archive(),
+                )
                 .distinct()
                 .limit(10)
                 .all()
@@ -197,6 +200,7 @@ class DataPointSeriesArchiveRepository:
                 .filter(
                     DataPointSeries.data_source_id.in_(source_id_list),
                     cast(DataPointSeries.recorded_at, Date) < cutoff_date,
+                    self._interval_safe_to_archive(),
                 )
                 .group_by(
                     DataPointSeries.data_source_id,
@@ -265,6 +269,7 @@ class DataPointSeriesArchiveRepository:
                 .filter(
                     DataPointSeries.data_source_id.in_(source_id_list),
                     cast(DataPointSeries.recorded_at, Date) < cutoff_date,
+                    self._interval_safe_to_archive(),
                 )
                 .delete(synchronize_session=False)
             )
@@ -273,6 +278,27 @@ class DataPointSeriesArchiveRepository:
             db.commit()
 
         return total_deleted
+
+    @staticmethod
+    def _interval_safe_to_archive() -> ColumnElement[bool]:
+        """Daily UTC buckets cannot preserve Google energy's intervals or local dates."""
+        google_sources = (
+            DataSource.__table__.select().with_only_columns(DataSource.id).where(DataSource.provider == "google")
+        )
+        return ~and_(
+            DataPointSeries.data_source_id.in_(google_sources),
+            DataPointSeries.series_type_definition_id.in_(
+                [
+                    get_series_type_id(t)
+                    for t in (
+                        SeriesType.energy,
+                        SeriesType.active_energy,
+                        SeriesType.total_energy,
+                        SeriesType.basal_energy,
+                    )
+                ]
+            ),
+        )
 
     def delete_archive_before(self, db: DbSession, cutoff_date: date) -> int:
         """Permanently delete archive rows older than *cutoff_date*.
@@ -381,7 +407,6 @@ class DataPointSeriesArchiveRepository:
                 func.sum(
                     case(
                         (DataPointSeriesArchive.series_type_definition_id == energy_id, DataPointSeriesArchive.value),
-                        else_=0,
                     )
                 ).label("active_energy_sum"),
                 func.sum(
@@ -390,7 +415,6 @@ class DataPointSeriesArchiveRepository:
                             DataPointSeriesArchive.series_type_definition_id == basal_energy_id,
                             DataPointSeriesArchive.value,
                         ),
-                        else_=0,
                     )
                 ).label("basal_energy_sum"),
                 func.avg(
@@ -427,6 +451,10 @@ class DataPointSeriesArchiveRepository:
             .join(DataSource, DataPointSeriesArchive.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
+                ~and_(
+                    DataSource.provider == "google",
+                    DataPointSeriesArchive.series_type_definition_id.in_([energy_id, basal_energy_id]),
+                ),
                 DataPointSeriesArchive.bucket_start_at >= start_ts,
                 DataPointSeriesArchive.bucket_start_at < end_ts,
                 DataPointSeriesArchive.series_type_definition_id.in_(series_type_ids),
@@ -449,8 +477,8 @@ class DataPointSeriesArchiveRepository:
                     "source": row.source,
                     "device_model": row.device_model,
                     "steps_sum": int(row.steps_sum) if row.steps_sum else 0,
-                    "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum else 0.0,
-                    "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum else 0.0,
+                    "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum is not None else None,
+                    "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum is not None else None,
                     "hr_avg": int(round(float(row.hr_avg))) if row.hr_avg is not None else None,
                     "hr_max": None,  # Not available in simplified archive
                     "hr_min": None,  # Not available in simplified archive

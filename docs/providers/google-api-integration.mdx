@@ -77,7 +77,17 @@ The Health API exposes the same underlying data through three different operatio
 | `hourly` / `daily` | `dataPoints:rollUp` | windowed | reconciled | none |
 
 <Info>
-`GOOGLE_USE_RECONCILE` only takes effect at `raw` granularity. `hourly`/`daily` always use windowed `rollUp` aggregates regardless of the flag.
+`GOOGLE_USE_RECONCILE` only takes effect at `raw` granularity. Except for energy,
+`hourly`/`daily` use windowed `rollUp` aggregates regardless of the flag. Energy v2
+uses native reconcile intervals for `active-energy-burned`. For `total-calories`,
+the live API rejects list with `UNSUPPORTED_DATA_TYPE_ACTION` and allows only
+`rollup,dailyRollup`, despite the calories guide's list example. Totals therefore
+use hourly rollups in chunks of at most 14 days by default, with unknown observed
+coverage. An explicit `GOOGLE_ENERGY_CALENDAR_TIMEZONE` instead enables the
+timezone-bound calendar-total mode described below.
+Requests align to UTC hour boundaries (the current hour stops at now), so repeated
+pulls update the same keys instead of accumulating sliding, overlapping windows.
+Energy has merged source attribution rather than per-device attribution.
 </Info>
 
 ### Reconcile vs. list — why it matters
@@ -101,6 +111,260 @@ Reconcile (2560) matches the app exactly — it keeps intervals that *either* so
 <Note>
 Choose `list` (`GOOGLE_USE_RECONCILE=false`) only when you specifically need per-device attribution (e.g. to know which watch recorded a reading). For app-matching totals, keep the default.
 </Note>
+
+## Daily energy contract (version 2)
+
+`GET /api/v1/users/{user_id}/summaries/activity` accepts the optional **`timezone`**
+query parameter, an IANA name such as `Asia/Bangkok`. Supply the same timezone on
+every page of a cursor-paginated request. `start_date` is inclusive and `end_date`
+exclusive; use civil date strings for local-day requests. Timezone-aware timestamp
+bounds are converted to dates in the selected zone; date-only/naive bounds are
+already civil dates. The timezone controls
+live activity buckets, including energy intervals, steps, HR minutes, and workout
+end dates. Omitting it retains stored offsets where available; Google energy with
+neither an offset nor a selected timezone uses UTC buckets with **unknown**
+coverage, not a claim about the user's local day. An invalid timezone returns 422.
+Archived non-energy daily buckets retain their original dates because their
+original intervals have already been discarded.
+
+The existing nullable fields `active_calories_kcal` and `total_calories_kcal`
+remain. `basal_calories_kcal` is additive and nullable. The following metadata
+object is additive on every activity summary:
+
+```json
+{
+  "date": "2026-09-08",
+  "active_calories_kcal": null,
+  "total_calories_kcal": 194.512,
+  "basal_calories_kcal": null,
+  "energy_metadata": {
+    "version": 2,
+    "metrics": {
+      "active_calories": {
+        "estimated": false,
+        "coverage": "unknown", "intervals": [],
+        "timezone": "Asia/Bangkok", "as_of": null,
+        "reason": "no_records", "source_type": null
+      },
+      "total_calories": {
+        "estimated": false,
+        "coverage": "unknown", "intervals": [],
+        "timezone": "Asia/Bangkok", "as_of": null,
+        "reason": "intervals_unavailable", "source_type": "legacy_google_total"
+      },
+      "basal_calories": {
+        "estimated": false,
+        "coverage": "unknown", "intervals": [],
+        "timezone": "Asia/Bangkok", "as_of": null,
+        "reason": "no_records", "source_type": null
+      }
+    }
+  }
+}
+```
+
+This is the energy portion of a summary, not the entire paginated response.
+Every metric metadata entry has:
+
+| Field | Meaning |
+|-------|---------|
+| `coverage` | `complete`, `partial`, or `unknown` |
+| `estimated` | Boolean, default false. True whenever any contributing interval is proportionally allocated, independently of coverage or reason |
+| `intervals` | Union of observed native coverage as `{start, end}` ISO timestamp pairs, clipped to the selected local day; not fabricated rollup windows |
+| `timezone` | Selected IANA timezone or null when only a fixed provider offset/unknown zone is available |
+| `as_of` | Latest ingestion timestamp for the observations, or null for historical rows without provenance |
+| `reason` | Optional explanation of gaps, missing evidence, overlap, or proportional allocation |
+| `source_type` | Provider data type or explicit legacy provenance |
+| `aggregation` | Optional calendar-total provenance, distinct from observed interval coverage; null without a qualifying calendar rollup |
+
+Metadata coalesces adjacent and overlapping observed intervals, preserving every
+gap. A continuous day of minute-level samples therefore returns one interval,
+not 1,440 entries. No raw sample lists are embedded in activity summaries.
+Compaction does not upgrade partial or unknown coverage to complete.
+Interval resolution uses a sorted boundary sweep and priority heap, with
+boundary counts for overlap detection: O(n log n) time and O(n) space per
+metric/day. Expired entries may remain buried in the heap, but are never
+rescanned at each boundary.
+Consumers must label values as estimated when `estimated=true`, even when
+`reason="interval_coverage_unavailable"` or another higher-priority reason hides
+the proportional-allocation explanation. For compatibility, also recognize
+`reason="proportional_interval_allocation"` as estimated.
+
+`complete` requires actual native intervals whose union exactly spans the
+matching local day, without uncertain overlap or proportional allocation.
+DST days can span 23 or 25 hours. A historical date, successful pagination,
+a plausible total, or a rollup's start/end window **never** proves complete
+on-wrist coverage. Provider start and end offsets are retained. Intervals extending beyond their ingestion time
+cannot be complete. Fixed offsets are retained; offset changes within a day
+without an explicit IANA timezone leave coverage unknown.
+
+An interval crossing midnight is split proportionally by elapsed time. The
+result is **partial**, with `reason="proportional_interval_allocation"`, not a
+measured calorie value for either subinterval. Overlapping intervals are never
+added twice: finer intervals take precedence, then newer ingestion revisions.
+Overlaps remain partial. A partial daily row cannot suppress valid finer data.
+Native upserts use the existing `(data_source_id, series_type_definition_id,
+recorded_at)` identity and update interval/provenance along with the value.
+
+Google's `active-energy-burned` is stored as `active_energy` (ID 89), separately
+from `total_energy` (ID 90). Active energy includes movement outside workouts.
+Workout gross calories remain separate and are not added to daily active energy.
+There is no Google basal/BMR endpoint and no app-BMR subtraction in this gateway.
+Missing data is null; explicit zero is retained, including zero total rollups.
+For applicable native list types (steps and distance), a valid interval with
+an omitted value field is a true zero, per Google's
+[data-presence documentation](https://developers.google.com/health/data-presence-and-true-zeros).
+That rule is not applied to active energy, which is not listed as supporting it.
+
+Legacy Google `energy` (ID 81) is **never** trusted as active. Known
+`google_health_api` legacy rows can contribute only a total with unknown coverage
+and no invented interval ends. Once corrected total rollups exist for that day,
+legacy window sums are not added to them because their overlap is unknown.
+Lossy archived Google energy buckets are excluded, not misrepresented as active
+or re-dated without interval evidence. Other providers' `energy` semantics
+are unchanged; their metadata remains unknown unless interval evidence exists.
+For legacy providers, total is computed only when both active and basal exist;
+missing basal is never silently converted to zero.
+
+### Calendar totals without claiming complete sensor coverage
+
+Set `GOOGLE_ENERGY_CALENDAR_TIMEZONE=Asia/Bangkok` in the gateway worker's
+configuration to fetch Google totals over that timezone's calendar days. Leave
+it unset to retain canonical UTC-hour totals. Invalid IANA names fail
+configuration validation. Other providers and Google active-energy ingestion
+are unchanged. The summary consumer must still request `timezone=Asia/Bangkok`.
+
+Google's [dailyRollUp reference](https://developers.google.com/health/reference/rest/v4/users.dataTypes.dataPoints/dailyRollUp)
+and [discovery schema](https://health.googleapis.com/$discovery/rest?version=v4)
+define `range.start/end` as `CivilDateTime` objects containing `date` and optional
+`time`. **Neither request nor response supports a timezone or UTC offset.**
+Do not attach a requested IANA timezone to a civil response as if Google verified
+it. Instead, calendar-total mode calls `dataPoints:rollUp` for `total-calories`,
+using exact physical midnight boundaries in the configured timezone:
+
+```json
+{
+  "range": {
+    "startTime": "2026-09-07T17:00:00Z",
+    "endTime": "2026-09-08T17:00:00Z"
+  },
+  "windowSize": "86400s",
+  "pageSize": 1
+}
+```
+
+This is September 8 in Bangkok. The default source family is `all-sources`,
+as defined by Google. The gateway requires the returned physical start and end
+to match the request exactly, and reads `totalCalories.kcalSum`. Missing values
+remain missing; explicit zero remains zero. One request is made per local day,
+with 23/25-hour windows on DST transitions. A past-day webhook naming just one
+changed hour re-fetches the entire local day. Today's upper bound is fetch time,
+rounded down to a whole second, not the following midnight.
+
+An eligible completed-day total exposes this **additional** object under
+`energy_metadata.metrics.total_calories.aggregation`:
+
+```json
+{
+  "kind": "calendar_day",
+  "source": "google_total_calories_rollup",
+  "data_source_family": "all-sources",
+  "date": "2026-09-08",
+  "timezone": "Asia/Bangkok",
+  "interval": {
+    "start": "2026-09-07T17:00:00Z",
+    "end": "2026-09-08T17:00:00Z"
+  },
+  "as_of": "2026-09-09T00:00:00Z",
+  "complete": true
+}
+```
+
+The metric itself still has `coverage="unknown"`, `intervals=[]`,
+`estimated=false`, and `reason="calendar_aggregation_not_wear_coverage"`.
+`aggregation.complete` means Google returned a total for the exact entire
+calendar aggregation window after it ended. It **does not** assert continuous
+wear, physiological measurement completeness, or that late provider updates
+can no longer revise the total. A past date or successful pagination alone
+never creates this provenance.
+
+The summary selects this full-day total instead of adding contained hourly
+windows. It requires ingestion version 2, matching persisted IANA provenance,
+exact selected-day boundaries, and an ingestion timestamp at or after the
+window end, no older than other available readings. A partial/current-day
+calendar response, an unmatched requested timezone, unversioned rows, and
+legacy totals do not qualify and have `aggregation=null`. Partial aggregates
+still cannot suppress finer intervals; proportional combinations retain
+`estimated=true`.
+
+Consumers estimating historical active calories as total minus their own BMR
+must independently validate the aggregation source, date, timezone, exact
+local-day interval, fetch timestamp, and `complete` flag. That subtraction is
+an **estimate**, not Google-reported active calories. Never subtract a full-day
+BMR from a partial/current-day total. The gateway does not do the subtraction
+or infer basal calories.
+
+No migration beyond energy-v2 `e2a947bc103d` is required: the IANA binding is
+persisted in `source_type="total-calories:calendar-rollup:Asia/Bangkok"` alongside
+the existing physical interval and ingestion timestamp. Calendar totals use
+the same `total_energy` series and canonical midnight upsert key; repeat pulls
+revise that row. They are not added to older hourly rows. Enable the setting
+and reload worker code only after existing owned pulls drain, then arrange one
+explicit bounded re-fetch. Merely changing configuration does not repair
+already-stored summaries.
+
+Example read, using a key supplied through the process environment:
+
+```bash
+curl --fail-with-body --get \
+  "http://localhost:8000/api/v1/users/00000000-0000-0000-0000-000000000001/summaries/activity" \
+  -H "X-Open-Wearables-API-Key: $OPEN_WEARABLES_API_KEY" \
+  --data-urlencode "start_date=2026-09-07" \
+  --data-urlencode "end_date=2026-09-09" \
+  --data-urlencode "timezone=Asia/Bangkok"
+```
+
+An empty `data` array means no eligible summary, not zero energy. Authorization
+and existing pagination behavior are unchanged; no new endpoint or rate limit
+is introduced.
+
+### Migration and coordinated rollout
+
+Apply Alembic revision **`e2a947bc103d`** before starting the corrected API and
+workers. It adds nullable interval/provenance columns and registers IDs 89/90.
+It does not relabel or delete historical rows. Downgrade deliberately fails while
+rows reference the new series IDs, rather than discarding corrected data.
+
+Google energy is excluded from lossy daily archival so interval evidence survives.
+This increases retained live-row storage when archival is enabled; the separately
+configured explicit deletion policy is unchanged. Already archived intervals
+cannot be reconstructed from daily sums.
+
+Google historical and live pulls retain mutual exclusion. Lock contention
+schedules at most five retries (60, 120, 240, 480, and 900 seconds), reports
+deferral/failure explicitly, and never advances the live cursor for a skipped
+pull. Failed energy fetches also retain the cursor and expose the failed data
+type rather than reporting empty success. Repeated consent errors require
+operator/user action, not invented zeros. Initial connections still require an
+explicit historical range to retrieve earlier history.
+
+An explicit Google `sync/historical?days=8` queues a new rolling eight-day pull
+and re-fetches existing intervals for upsert. It does **not** cancel or supersede
+an automatic 90-day pull already queued by OAuth. The OAuth grace-period flag
+is a compatibility setting, not a cancellable timer: integrations that explicitly
+request history must separately configure `HISTORICAL_SYNC_ON_CONNECT=false`.
+Already running work retains its original range. Do not restart a worker with
+active work solely to load this code; coordinate worker reload and the final
+bounded sync after active work drains.
+
+The manually invoked repair module
+`scripts/data_migrations/repair_google_energy.py` defaults to a read-only scoped
+report. Its module docstring documents authorization scope, explicit apply,
+before-state snapshots, conflict handling, and limitations. It is **not** an
+automatic startup migration or a provider re-fetch. Coordinate native historical
+sync and downstream cache/energy-field invalidation separately after reviewing
+the report. Deployment, actual account consent/capability verification, and any
+live repair require separate approval.
 
 ## What you need by the end
 
@@ -154,6 +418,7 @@ GOOGLE_USE_RECONCILE=true
     | `GOOGLE_CLIENT_SECRET` | OAuth Client Secret | — |
     | `GOOGLE_DEFAULT_SCOPE` | Space-separated Health API scopes to request | (full read-only set) |
     | `GOOGLE_USE_RECONCILE` | `true` = reconcile (merged, app-accurate, no device attribution); `false` = list (per-device). Only applies at `raw` granularity. | `true` |
+    | `GOOGLE_ENERGY_CALENDAR_TIMEZONE` | Optional IANA timezone for exact local-day Google total-calorie rollups. Does not establish sensor wear coverage. | unset (hourly totals) |
     | `DEFAULT_DATA_GRANULARITY` | `raw` \| `hourly` \| `daily` — see the [fetch modes](#data-granularity-and-fetch-modes) table | `raw` |
 
     <Note>

@@ -865,6 +865,7 @@ class EventRecordRepository(
         user_id: UUID,
         start_date: datetime,
         end_date: datetime,
+        timezone_name: str | None = None,
     ) -> list[dict]:
         """Get daily workout aggregates including elevation, distance, and energy.
 
@@ -878,6 +879,8 @@ class EventRecordRepository(
             self.model.end_datetime + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
             Date,
         )
+        if timezone_name:
+            local_workout_date = cast(func.timezone(timezone_name, self.model.end_datetime), Date)
 
         results = (
             db_session.query(

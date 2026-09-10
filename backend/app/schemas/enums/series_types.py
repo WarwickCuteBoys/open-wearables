@@ -74,6 +74,8 @@ class SeriesType(str, Enum):
     # =========================================================================
     steps = "steps"
     energy = "energy"  # Active energy burned
+    active_energy = "active_energy"  # Explicit active-only energy (Google v2)
+    total_energy = "total_energy"  # Includes basal; never an alias for active energy
     basal_energy = "basal_energy"
     stand_time = "stand_time"
     exercise_time = "exercise_time"
@@ -233,6 +235,8 @@ SERIES_TYPE_DEFINITIONS: list[tuple[int, SeriesType, str]] = [
     (86, SeriesType.flights_climbed, "count"),
     (87, SeriesType.average_met, "met"),
     (88, SeriesType.active_time, "minutes"),
+    (89, SeriesType.active_energy, "kcal"),
+    (90, SeriesType.total_energy, "kcal"),
     # -------------------------------------------------------------------------
     # ACTIVITY - Distance (IDs 100-119)
     # -------------------------------------------------------------------------

@@ -27,10 +27,16 @@ ACTIVITY_METRICS: tuple[DataTypeMetric, ...] = (
         list_spec=ListSpec("millimeters", TimeShape.INTERVAL, scale=_MM_TO_M),
     ),
     DataTypeMetric(
+        "active-energy-burned",
+        SeriesType.active_energy,
+        value_key="activeEnergyBurned",
+        list_spec=ListSpec("kcal", TimeShape.INTERVAL),
+    ),
+    DataTypeMetric(
         "total-calories",
-        SeriesType.energy,
+        SeriesType.total_energy,
         value_key="totalCalories",
-        rollup_spec=RollupSpec("kcalSum", max_range_days=14),  # rollUp-only
+        rollup_spec=RollupSpec("kcalSum", max_range_days=14),
     ),
     DataTypeMetric(
         "hydration-log",

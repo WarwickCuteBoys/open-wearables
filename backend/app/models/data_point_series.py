@@ -1,5 +1,5 @@
-from uuid import UUID
 from datetime import datetime
+from uuid import UUID
 
 from sqlalchemy import UniqueConstraint
 from sqlalchemy.orm import Mapped
@@ -33,6 +33,12 @@ class DataPointSeries(BaseDbModel):
     data_source_id: Mapped[FKDataSource]
     recorded_at: Mapped[datetime]
     zone_offset: Mapped[str_10 | None]
+    interval_end: Mapped[datetime | None]
+    end_zone_offset: Mapped[str_10 | None]
+    source_type: Mapped[str_100 | None]
+    ingestion_version: Mapped[int | None]
+    coverage_known: Mapped[bool | None]
+    ingested_at: Mapped[datetime | None]
     value: Mapped[numeric_10_3]
     series_type_definition_id: Mapped[FKSeriesTypeDefinition]
-    is_daily_total: Mapped[bool | None] # True = pre-aggregated daily total; False = granular intraday samples
+    is_daily_total: Mapped[bool | None]  # True = pre-aggregated daily total; False = granular intraday samples
