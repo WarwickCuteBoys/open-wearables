@@ -359,15 +359,15 @@ def test_native_ingestion_keeps_intervals_semantics_and_true_zeros(
         assert sample.source_type == data_type
 
 
-def test_energy_uses_native_even_when_daily_configured_and_chunks_14_days() -> None:
+def test_energy_uses_native_even_when_daily_configured_and_bounds_memory_to_one_day() -> None:
     handler = GoogleHealth247Data(MagicMock(), MagicMock(), "https://health.googleapis.com")
     metric = next(m for m in ACTIVITY_METRICS if m.data_type == "active-energy-burned")
     handler.settings_repo = MagicMock()
     handler.settings_repo.get_data_granularity.return_value = DataGranularity.DAILY
     with patch.object(handler, "_native_samples", return_value=[]) as native:
         handler.sync_data_type(MagicMock(), uuid4(), metric.data_type, LOW, LOW + timedelta(days=30))
-    assert native.call_count == 3
-    assert all((call.args[4] - call.args[3]).days <= 14 for call in native.call_args_list)
+    assert native.call_count == 30
+    assert all(call.args[4] - call.args[3] <= timedelta(days=1) for call in native.call_args_list)
 
 
 @pytest.mark.parametrize("value", [0, 150])

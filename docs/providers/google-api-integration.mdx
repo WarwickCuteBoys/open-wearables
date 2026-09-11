@@ -42,13 +42,18 @@ The Google Health API is an **aggregation layer**: it surfaces data from *every*
 | **Polling (pull)** | Open Wearables periodically fetches data via the Health API (Celery Beat), driven by the [fetch mode](#data-granularity-and-fetch-modes) below. |
 | **Webhooks (notify-only)** | Google sends a lightweight ping naming the changed `dataType` and time intervals; Open Wearables then fetches the changed data over REST. Requires a project-level [subscriber registration](#webhook-subscriber-registration). |
 
-### Sleep-first historical sync
+### Progressive historical sync
 
-The 24/7 sync imports and commits sleep from the last seven days of the requested
-range first, clipped to the requested start. It then imports older sleep before
-fetching the full requested range of activity, heart, body, and vital metrics at
-the configured resolution. Recent sleep is therefore queryable without waiting
-for a long raw-metric backfill.
+The 24/7 sync fetches total and active energy first, newest windows first, and
+commits each metric window independently. Other time-series requests are also
+bounded to one day, rather than buffering an entire multi-day raw backfill.
+Successful windows survive a later failure and emit data-ready webhooks as soon
+as the outer transaction commits. Notifications retain neither committed sample
+arrays for the session lifetime nor data from rolled-back savepoints.
+
+After energy, sleep from the last seven days is imported before older sleep and
+raw activity, heart, body, and vital metrics. Recent sleep remains queryable
+without waiting for the raw-metric backfill.
 
 Sleep windows are adjacent and start-inclusive/end-exclusive. A session starting
 at the split belongs only to the recent window; a session crossing it belongs to
@@ -65,6 +70,21 @@ writes are committed, any fetch or write failures are logged and raised to the
 sync task, which marks the 24/7 sub-task unsuccessful rather than reporting the
 entire import as successful. The overall sync status still follows the existing
 task's failure/partial-success rules.
+
+Google pull ownership uses a 90-second lease renewed every 30 seconds. The worker
+also verifies ownership before fetching another metric page and before database
+flushes/commits. Detected ownership loss rejects subsequent writes rather than
+continuing behind a replacement. Other providers retain their existing longer lock policy.
+A killed Google worker therefore cannot leave a new four-hour blocking lock.
+Legacy locks created by older versions retain their original expiry; do not
+delete an unknown owner's lock during an upgrade.
+
+Subscribe to `calories.created` for both `active_energy` and `total_energy`, or
+their granular `series.active_energy.created` and `series.total_energy.created`
+events. Energy corrections use content-sensitive idempotency keys: unchanged
+retries deduplicate, but a revised value or interval is delivered again.
+An enabled outgoing webhook destination and its matching signing key are still
+required. Running Svix alone does not configure delivery to a consuming app.
 
 ## Data granularity and fetch modes
 

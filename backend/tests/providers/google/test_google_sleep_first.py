@@ -1,6 +1,7 @@
 """Sleep-first ordering, transaction isolation, and requested-window coverage."""
 
 from datetime import datetime, timedelta, timezone
+from itertools import chain, repeat
 from typing import Any
 from unittest.mock import MagicMock, call
 from uuid import UUID, uuid4
@@ -19,6 +20,7 @@ END = datetime(2026, 9, 8, 5, tzinfo=timezone.utc)
 START = END - timedelta(days=90)
 BOUNDARY = END - timedelta(days=7)
 USER_ID = UUID("00000000-0000-0000-0000-000000000001")
+WINDOWS = list(google.GoogleHealth247Data._recent_windows(START, END))
 
 
 @pytest.fixture
@@ -53,8 +55,7 @@ def test_recent_sleep_commits_before_history_and_metrics(handler: google.GoogleH
     first_metric = next(i for i, c in enumerate(sync.mock_calls) if c[0] == "metric")
     assert sync.mock_calls.index(recent) < first_commit < sync.mock_calls.index(older) < first_metric
     assert sync.db.commit.call_count == 2
-    for metric_call in sync.metric.call_args_list:
-        assert metric_call.args[3:5] == (START, END)
+    assert [c.args[3:5] for c in sync.metric.call_args_list] == WINDOWS * len(google.METRICS)
     assert result == {}
 
 
@@ -101,8 +102,8 @@ def test_sleep_failure_rolls_back_and_preserves_other_work(
     sync.failure.assert_called_once_with(failed_window, USER_ID, error)
     sync.db.rollback.assert_called_once()
     assert sync.sleep.call_count == 2
-    assert sync.bulk.call_count == len(google.METRICS)
-    assert sync.db.commit.call_count == 2  # Successful sleep window and metrics.
+    assert sync.bulk.call_count == len(google.METRICS) * len(WINDOWS)
+    assert sync.db.commit.call_count == 1 + sync.bulk.call_count
 
 
 def test_metric_failures_are_reported_after_sleep_commits(handler: google.GoogleHealth247Data, sync: MagicMock) -> None:
@@ -110,7 +111,7 @@ def test_metric_failures_are_reported_after_sleep_commits(handler: google.Google
     with pytest.raises(RuntimeError, match="partially failed:.*raw metrics unavailable"):
         handler.load_and_save_all(sync.db, USER_ID, START, END)
     assert sync.db.commit.call_count == 2
-    assert sync.failure.call_count == len(google.METRICS)
+    assert sync.failure.call_count == len(google.METRICS) * len(WINDOWS)
 
 
 @pytest.mark.parametrize("failure_site", ["metric", "bulk"])
@@ -119,15 +120,15 @@ def test_one_metric_failure_preserves_other_metric_writes(
 ) -> None:
     sync.metric.return_value = [MagicMock()]
     failing_call = getattr(sync, failure_site)
-    failing_call.side_effect = [RuntimeError("metric failed"), failing_call.return_value]
+    failing_call.side_effect = chain([RuntimeError("metric failed")], repeat(failing_call.return_value))
 
     with pytest.raises(RuntimeError, match="partially failed:.*metric failed"):
         handler.load_and_save_all(sync.db, USER_ID, START, END)
 
     sync.failure.assert_called_once()
-    assert sync.db.begin_nested.call_count == len(google.METRICS)
-    assert sync.db.commit.call_count == 3
-    assert sync.metric.call_count == len(google.METRICS)
+    sync.db.begin_nested.assert_not_called()
+    assert sync.db.commit.call_count == 1 + len(google.METRICS) * len(WINDOWS)
+    assert sync.metric.call_count == len(google.METRICS) * len(WINDOWS)
 
 
 def test_all_failures_still_raise(handler: google.GoogleHealth247Data, sync: MagicMock) -> None:
@@ -135,8 +136,8 @@ def test_all_failures_still_raise(handler: google.GoogleHealth247Data, sync: Mag
     sync.metric.side_effect = RuntimeError("metrics unavailable")
     with pytest.raises(RuntimeError, match="All Google 24/7 data types failed"):
         handler.load_and_save_all(sync.db, USER_ID, START, END)
-    assert sync.failure.call_count == len(google.METRICS) + 2
-    assert sync.db.rollback.call_count == 2
+    assert sync.failure.call_count == len(google.METRICS) * len(WINDOWS) + 2
+    assert sync.db.rollback.call_count == sync.failure.call_count
     sync.db.commit.assert_not_called()
 
 
@@ -145,7 +146,7 @@ def test_commit_failure_is_not_a_success(handler: google.GoogleHealth247Data, sy
     with pytest.raises(RuntimeError, match="partially failed:.*sleep_recent.*commit failed"):
         handler.load_and_save_all(sync.db, USER_ID, START, END)
     sync.db.rollback.assert_called_once()
-    assert sync.metric.call_count == len(google.METRICS)
+    assert sync.metric.call_count == len(google.METRICS) * len(WINDOWS)
 
 
 @pytest.mark.parametrize("granularity", [DataGranularity.RAW, DataGranularity.DAILY])
@@ -155,11 +156,10 @@ def test_metric_write_counts_and_requested_range_are_preserved(
     handler.settings_repo.get_data_granularity.return_value = granularity
     sync.metric.return_value = [MagicMock()]
     result = handler.load_and_save_all(sync.db, USER_ID, START, END)
-    assert result == {metric.data_type: sync.bulk.return_value for metric in google.METRICS}
-    assert all(count.inserted == 1 and count.updated == 0 for count in result.values())
-    for metric_call in sync.metric.call_args_list:
-        assert metric_call.args[3:5] == (START, END)
-    assert sync.db.commit.call_count == 3
+    assert result == {metric.data_type: WriteCounts(len(WINDOWS), 0) for metric in google.METRICS}
+    assert all(count.inserted == len(WINDOWS) and count.updated == 0 for count in result.values())
+    assert [c.args[3:5] for c in sync.metric.call_args_list] == WINDOWS * len(google.METRICS)
+    assert sync.db.commit.call_count == 2 + len(WINDOWS) * len(google.METRICS)
 
 
 def sleep_point(start: datetime, name: str) -> dict[str, Any]:
@@ -233,7 +233,7 @@ def test_recent_sleep_is_visible_from_another_session_despite_later_database_fai
                 handler.load_and_save_all(db, user_id, START, END)
             assert "division by zero" in str(exc.value)
             assert visible_sleep_minutes == [420]
-            assert usable_metric_sessions == [1] * len(google.METRICS)
+            assert usable_metric_sessions == [1] * len(google.METRICS) * len(WINDOWS)
             db.rollback()
             with Session(engine) as reader:
                 record = reader.scalars(query).one()
