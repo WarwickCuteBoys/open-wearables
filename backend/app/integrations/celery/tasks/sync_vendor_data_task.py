@@ -14,7 +14,13 @@ from app.schemas.auth import LiveSyncMode
 from app.schemas.responses.upload import ProviderSyncResult, SyncVendorDataResult
 from app.schemas.sync_status import SyncSource, SyncStage, SyncStatus
 from app.services.providers.factory import ProviderFactory
-from app.services.sync_coordination import release_primary, release_stale_primary, try_become_primary
+from app.services.sync_coordination import (
+    GooglePullLease,
+    SyncLeaseLostError,
+    release_primary,
+    release_stale_primary,
+    try_become_primary,
+)
 from app.services.sync_status_service import completed, failed, new_run_id, progress, started
 from app.utils.config_utils import format_duration
 from app.utils.context import trace_id_var
@@ -294,7 +300,11 @@ def sync_vendor_data(
                     },
                 )
 
+                lease: GooglePullLease | None = None
                 try:
+                    if provider_name == "google" and shared_token and connection.provider_user_id:
+                        lease = GooglePullLease(connection.provider_user_id, user_uuid, shared_token)
+                        lease.start(db)
                     strategy = factory.get_provider(provider_name)
                     provider_result = ProviderSyncResult(success=True, params={})
 
@@ -342,6 +352,8 @@ def sync_vendor_data(
                         try:
                             success = strategy.workouts.load_data(db, user_uuid, **params)
                             provider_result.params["workouts"] = {"success": success, **params}
+                        except SyncLeaseLostError:
+                            raise
                         except Exception as e:
                             log_structured(
                                 logger,
@@ -418,6 +430,8 @@ def sync_vendor_data(
                                 task="sync_vendor_data",
                                 user_id=user_id,
                             )
+                        except SyncLeaseLostError:
+                            raise
                         except Exception as e:
                             log_structured(
                                 logger,
@@ -450,6 +464,8 @@ def sync_vendor_data(
                         user_connection_repo.update_last_synced_at(db, connection)
 
                     if shared_token and connection.provider_user_id:
+                        if lease is not None:
+                            lease.close()
                         release_primary(
                             provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
                         )
@@ -557,6 +573,9 @@ def sync_vendor_data(
                         )
 
                 except Exception as e:
+                    db.rollback()
+                    if lease is not None:
+                        lease.close()
                     if shared_token and connection.provider_user_id:
                         release_primary(
                             provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
@@ -584,6 +603,9 @@ def sync_vendor_data(
                     )
                     result.errors[provider_name] = str(e)
                     continue
+                finally:
+                    if lease is not None:
+                        lease.close()
 
             return result.model_dump()
 

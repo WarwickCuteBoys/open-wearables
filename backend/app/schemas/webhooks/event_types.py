@@ -133,6 +133,8 @@ class WebhookEventType(StrEnum):
     # Steps & calories
     SERIES_STEPS = "series.steps.created"
     SERIES_ENERGY = "series.energy.created"
+    SERIES_ACTIVE_ENERGY = "series.active_energy.created"
+    SERIES_TOTAL_ENERGY = "series.total_energy.created"
     SERIES_BASAL_ENERGY = "series.basal_energy.created"
 
     # Activity basic
@@ -270,6 +272,8 @@ EVENT_TYPE_DESCRIPTIONS: dict[WebhookEventType, str] = {
     WebhookEventType.SERIES_GARMIN_FITNESS_AGE: "Garmin fitness age estimates were ingested.",
     WebhookEventType.SERIES_STEPS: "Step count samples were ingested.",
     WebhookEventType.SERIES_ENERGY: "Active energy (calories) samples were ingested.",
+    WebhookEventType.SERIES_ACTIVE_ENERGY: "Active-only energy samples were ingested.",
+    WebhookEventType.SERIES_TOTAL_ENERGY: "Total energy expenditure samples were ingested.",
     WebhookEventType.SERIES_BASAL_ENERGY: "Basal energy samples were ingested.",
     WebhookEventType.SERIES_STAND_TIME: "Stand time samples were ingested.",
     WebhookEventType.SERIES_EXERCISE_TIME: "Exercise time samples were ingested.",
@@ -389,6 +393,8 @@ EVENT_TYPE_GROUPS: dict[str, list[str]] = {
     ],
     WebhookEventType.CALORIES_CREATED: [
         WebhookEventType.SERIES_ENERGY,
+        WebhookEventType.SERIES_ACTIVE_ENERGY,
+        WebhookEventType.SERIES_TOTAL_ENERGY,
         WebhookEventType.SERIES_BASAL_ENERGY,
     ],
     WebhookEventType.ACTIVITY_CREATED_TIMESERIES: [

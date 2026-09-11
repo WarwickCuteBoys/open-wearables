@@ -11,6 +11,7 @@ come from the sessions endpoint and are handled separately.
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from time import monotonic
 from typing import Any, NoReturn
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -40,6 +41,7 @@ from app.services.providers.google.health_api.sleep import GoogleHealthApiSleep
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.raw_payload_storage import store_raw_payload
+from app.services.sync_coordination import SyncLeaseLostError, check_google_pull_lease
 from app.services.timeseries_service import timeseries_service
 from app.utils.dates import offset_to_iso
 from app.utils.sentry_helpers import log_and_capture_error
@@ -72,7 +74,7 @@ class GoogleHealth247Data(Base247DataTemplate):
         end_time: datetime,
         is_first_sync: bool = False,
     ) -> dict[str, WriteCounts]:
-        """Persist recent sleep first, then full history; report failures after saving successes."""
+        """Commit energy promptly, then recent sleep and bounded raw history."""
         if start_time > end_time:
             raise ValueError("start_time must be before or equal to end_time")
         if start_time == end_time:
@@ -94,16 +96,58 @@ class GoogleHealth247Data(Base247DataTemplate):
         succeeded = 0
         sleep_count = 0
 
+        def sync_metric(metric: DataTypeMetric) -> None:
+            nonlocal succeeded
+            for low, high in self._recent_windows(start_time, end_time):
+                began = monotonic()
+                try:
+                    counts = self._save_metric(db, user_id, metric, low, high, granularity)
+                except SyncLeaseLostError:
+                    db.rollback()
+                    raise
+                except Exception as e:
+                    db.rollback()
+                    self._log_metric_failure(metric.data_type, user_id, e)
+                    failures[metric.data_type] = str(e)
+                    continue
+                succeeded += 1
+                if counts is not None:
+                    previous = results.get(metric.data_type, WriteCounts(0, 0))
+                    results[metric.data_type] = WriteCounts(
+                        previous.inserted + counts.inserted, previous.updated + counts.updated
+                    )
+                log_structured(
+                    self.logger,
+                    "info",
+                    "Google metric window committed",
+                    provider=self.provider_name,
+                    task="load_and_save_all",
+                    data_type=metric.data_type,
+                    start_time=low.isoformat(),
+                    end_time=high.isoformat(),
+                    elapsed_seconds=round(monotonic() - began, 3),
+                )
+
+        # Publish cheap daily energy before raw history can delay or exhaust the worker.
+        for series in (SeriesType.total_energy, SeriesType.active_energy):
+            for metric in METRICS:
+                if metric.series_type == series:
+                    sync_metric(metric)
+
         recent_start = max(start_time, end_time - timedelta(days=self.RECENT_SLEEP_DAYS))
         sleep_windows = [("sleep_recent", recent_start, end_time)]
         if start_time < recent_start:
             sleep_windows.append(("sleep_history", start_time, recent_start))
         for data_type, window_start, window_end in sleep_windows:
             # Sleep merge-saves commit internally, so a savepoint cannot isolate this
-            # handler. Run it before metrics, with a separate transaction per window.
+            # handler. Use a separate transaction per sleep window.
             try:
+                check_google_pull_lease(db)
                 count = self.sleep.load_and_save(db, user_id, window_start, window_end)
                 db.commit()
+            except SyncLeaseLostError:
+                db.rollback()
+                raise
             except Exception as e:
                 db.rollback()
                 self._log_metric_failure(data_type, user_id, e)
@@ -113,27 +157,8 @@ class GoogleHealth247Data(Base247DataTemplate):
             succeeded += 1
 
         for metric in METRICS:
-            # Confine each metric (fetch + write) to a savepoint so a failed write rolls
-            # back only that metric and leaves the transaction usable for the rest.
-            try:
-                with db.begin_nested():
-                    if metric.series_type in ENERGY_TYPES:
-                        samples = self._energy_samples(db, user_id, metric, start_time, end_time)
-                    elif metric.use_list(granularity):
-                        samples = self._native_samples(db, user_id, metric, start_time, end_time)
-                    else:
-                        samples = self._rollup_samples(db, user_id, metric, start_time, end_time, granularity)
-                    counts = timeseries_service.bulk_create_samples(db, samples) if samples else None
-            except Exception as e:
-                self._log_metric_failure(metric.data_type, user_id, e)
-                failures[metric.data_type] = str(e)
-                continue
-            succeeded += 1
-            if counts is not None:
-                results[metric.data_type] = counts
-
-        if results:
-            db.commit()
+            if metric.series_type not in ENERGY_TYPES:
+                sync_metric(metric)
 
         # The caller treats a normal return as success. Preserve successful writes but
         # surface partial failures too, including an incomplete older sleep window.
@@ -179,12 +204,43 @@ class GoogleHealth247Data(Base247DataTemplate):
         granularity = (
             self.settings_repo.get_data_granularity(db, self.provider_name) or settings.default_data_granularity
         )
+        result: WriteCounts | None = None
+        for low, high in self._recent_windows(start_time, end_time):
+            try:
+                counts = self._save_metric(db, user_id, metric, low, high, granularity)
+            except Exception:
+                db.rollback()
+                raise
+            if counts is not None:
+                previous = result or WriteCounts(0, 0)
+                result = WriteCounts(previous.inserted + counts.inserted, previous.updated + counts.updated)
+        return result
+
+    @staticmethod
+    def _recent_windows(start: datetime, end: datetime) -> Iterator[tuple[datetime, datetime]]:
+        if start > end:
+            raise ValueError("start_time must be before or equal to end_time")
+        while end > start:
+            low = max(start, end - timedelta(days=1))
+            yield low, end
+            end = low
+
+    def _save_metric(
+        self,
+        db: DbSession,
+        user_id: UUID,
+        metric: DataTypeMetric,
+        start: datetime,
+        end: datetime,
+        granularity: DataGranularity,
+    ) -> WriteCounts | None:
+        check_google_pull_lease(db)
         if metric.series_type in ENERGY_TYPES:
-            samples = self._energy_samples(db, user_id, metric, start_time, end_time)
+            samples = self._energy_samples(db, user_id, metric, start, end)
         elif metric.use_list(granularity):
-            samples = self._native_samples(db, user_id, metric, start_time, end_time)
+            samples = self._native_samples(db, user_id, metric, start, end)
         else:
-            samples = self._rollup_samples(db, user_id, metric, start_time, end_time, granularity)
+            samples = self._rollup_samples(db, user_id, metric, start, end, granularity)
         if not samples:
             return None
         counts = timeseries_service.bulk_create_samples(db, samples)
@@ -349,7 +405,9 @@ class GoogleHealth247Data(Base247DataTemplate):
         """Fetch one within-limit range, following pageToken to exhaustion."""
         points: list[dict[str, Any]] = []
         page_token: str | None = None
+        seen_tokens: set[str] = set()
         while True:
+            check_google_pull_lease(db)
             body: dict[str, Any] = {
                 "range": physical_interval(start_time, end_time),
                 "windowSize": f"{window_seconds}s",
@@ -381,6 +439,9 @@ class GoogleHealth247Data(Base247DataTemplate):
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
+            if not isinstance(page_token, str) or page_token in seen_tokens:
+                raise ValueError("Invalid or repeated Google pagination token")
+            seen_tokens.add(page_token)
         return points
 
     @staticmethod
@@ -519,7 +580,9 @@ class GoogleHealth247Data(Base247DataTemplate):
         """
         points: list[dict[str, Any]] = []
         page_token: str | None = None
+        seen_tokens: set[str] = set()
         while True:
+            check_google_pull_lease(db)
             params: dict[str, Any] = {"pageSize": self.LIST_PAGE_SIZE}
             if time_filter:
                 params["filter"] = time_filter
@@ -549,6 +612,9 @@ class GoogleHealth247Data(Base247DataTemplate):
             page_token = response.get("nextPageToken")
             if not page_token:
                 break
+            if not isinstance(page_token, str) or page_token in seen_tokens:
+                raise ValueError("Invalid or repeated Google pagination token")
+            seen_tokens.add(page_token)
         return points
 
     def _sample(

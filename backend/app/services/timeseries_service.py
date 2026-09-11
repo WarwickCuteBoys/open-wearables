@@ -6,6 +6,7 @@ from typing import Any
 from uuid import UUID
 
 from sqlalchemy import event as sa_event
+from sqlalchemy.orm import SessionTransaction
 
 from app.database import DbSession
 from app.models import DataPointSeries
@@ -36,6 +37,36 @@ from app.services.services import AppService
 from app.utils.exceptions import handle_exceptions
 from app.utils.pagination import encode_cursor
 
+_PENDING_WEBHOOKS = "timeseries_pending_webhooks"
+_WEBHOOK_LISTENERS = "timeseries_webhook_listeners"
+
+
+def _committed_webhooks(session: DbSession) -> None:
+    if session.in_nested_transaction():
+        return
+    batches = session.info.pop(_PENDING_WEBHOOKS, {})
+    if not svix_service.is_enabled():
+        return
+    samples = [sample for batch in batches.values() for sample in batch]
+    if samples:
+        threading.Thread(target=TimeSeriesService._emit_timeseries_webhooks, args=(samples,), daemon=True).start()
+
+
+def _rolled_back_webhooks(session: DbSession, transaction: SessionTransaction) -> None:
+    batches = session.info.get(_PENDING_WEBHOOKS, {})
+    for owner in list(batches):
+        ancestor = owner
+        while ancestor is not None:
+            if ancestor is transaction:
+                del batches[owner]
+                break
+            ancestor = ancestor.parent
+
+
+def _ended_webhook_transaction(session: DbSession, transaction: SessionTransaction) -> None:
+    if transaction.parent is None:
+        session.info.pop(_PENDING_WEBHOOKS, None)
+
 
 class TimeSeriesService(
     AppService[
@@ -56,18 +87,17 @@ class TimeSeriesService(
         samples: (list[TimeSeriesSampleCreate] | list[HeartRateSampleCreate] | list[StepSampleCreate]),
     ) -> WriteCounts:
         counts = self.crud.bulk_create(db_session, samples)  # ty:ignore[invalid-argument-type]
-        samples_copy = list(samples)
-
-        @sa_event.listens_for(db_session, "after_commit", once=True)
-        def _start_webhook_thread(session: DbSession) -> None:  # noqa: ARG001
-            if not svix_service.is_enabled():
-                return
-            threading.Thread(
-                target=self._emit_timeseries_webhooks,
-                args=(samples_copy,),
-                daemon=True,
-            ).start()
-
+        if samples:
+            # A once=True listener still retains its closure for the session lifetime.
+            # Keep payloads in transaction-owned state instead, and discard rollbacks.
+            if not db_session.info.get(_WEBHOOK_LISTENERS):
+                sa_event.listen(db_session, "after_commit", _committed_webhooks)
+                sa_event.listen(db_session, "after_soft_rollback", _rolled_back_webhooks)
+                sa_event.listen(db_session, "after_transaction_end", _ended_webhook_transaction)
+                db_session.info[_WEBHOOK_LISTENERS] = True
+            transaction = db_session.get_nested_transaction() or db_session.get_transaction()
+            pending = db_session.info.setdefault(_PENDING_WEBHOOKS, {})
+            pending.setdefault(transaction, []).extend(samples)
         return counts
 
     @staticmethod
@@ -98,6 +128,15 @@ class TimeSeriesService(
                     }
                     for s in sorted_samples
                 ]
+                if series_type_value in {"active_energy", "total_energy"}:
+                    for original, payload in zip(sorted_samples, webhook_samples, strict=True):
+                        if isinstance(original, TimeSeriesSampleCreate):
+                            payload["energy_metadata"] = {
+                                "interval_end": original.interval_end.isoformat() if original.interval_end else None,
+                                "source_type": original.source_type,
+                                "ingestion_version": original.ingestion_version,
+                                "coverage_known": original.coverage_known,
+                            }
                 on_timeseries_batch_saved(
                     user_id=user_id,
                     provider=provider,

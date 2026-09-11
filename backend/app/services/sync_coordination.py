@@ -18,7 +18,11 @@ Redis keys (scoped to provider + provider_user_id + scope):
 """
 
 import logging
+import threading
 from uuid import UUID, uuid4
+
+from sqlalchemy import event
+from sqlalchemy.orm import Session
 
 from app.integrations.redis_client import get_redis_client
 
@@ -27,6 +31,7 @@ logger = logging.getLogger(__name__)
 _PREFIX = "linked_sync"
 _PRIMARY_TTL = 4 * 60 * 60  # 4 h — covers longest Garmin backfill
 _SECONDARY_TTL = 4 * 60 * 60
+GOOGLE_PULL_LEASE_SECONDS = 90
 
 # Atomically delete a key only if its current value matches ARGV[1].
 # Prevents releasing a lock that was already expired and re-acquired by
@@ -70,7 +75,8 @@ def try_become_primary(
     token = uuid4().hex
     value = f"{user_id}:{token}"
 
-    acquired = bool(client.set(key, value, nx=True, ex=_PRIMARY_TTL))
+    ttl = GOOGLE_PULL_LEASE_SECONDS if provider == "google" and scope == "pull" else _PRIMARY_TTL
+    acquired = bool(client.set(key, value, nx=True, ex=ttl))
     if acquired:
         return True, token, user_id
 
@@ -83,6 +89,73 @@ def try_become_primary(
         except (ValueError, IndexError):
             pass
     return False, "", None
+
+
+class SyncLeaseLostError(RuntimeError):
+    """A pull must stop writing after losing distributed ownership."""
+
+
+class GooglePullLease:
+    def __init__(self, provider_user_id: str, user_id: UUID, token: str) -> None:
+        self.key = _primary_key("google", provider_user_id, "pull")
+        self.value = f"{user_id}:{token}"
+        self._stop = threading.Event()
+        self._lost = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._session: Session | None = None
+
+    def check(self, *_args: object) -> None:
+        if self._lost.is_set():
+            raise SyncLeaseLostError("Google sync lease was lost; refusing further writes")
+        try:
+            renewed = get_redis_client().eval(
+                "if redis.call('get',KEYS[1]) == ARGV[1] then "
+                "return redis.call('expire',KEYS[1],ARGV[2]) else return 0 end",
+                1,
+                self.key,
+                self.value,
+                GOOGLE_PULL_LEASE_SECONDS,
+            )
+        except Exception as exc:
+            self._lost.set()
+            raise SyncLeaseLostError("Google sync lease could not be verified") from exc
+        if not renewed:
+            self._lost.set()
+            raise SyncLeaseLostError("Google sync lease belongs to another run or expired")
+
+    def _renew(self) -> None:
+        while not self._stop.wait(GOOGLE_PULL_LEASE_SECONDS / 3):
+            try:
+                self.check()
+            except SyncLeaseLostError:
+                logger.exception("Google pull lease renewal failed; subsequent commits will be rejected")
+                return
+
+    def start(self, session: Session) -> None:
+        self.check()
+        self._session = session
+        session.info["google_pull_lease"] = self
+        event.listen(session, "before_commit", self.check)
+        event.listen(session, "before_flush", self.check)
+        self._thread = threading.Thread(target=self._renew, daemon=True)
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+        if self._session is not None:
+            event.remove(self._session, "before_commit", self.check)
+            event.remove(self._session, "before_flush", self.check)
+            self._session.info.pop("google_pull_lease", None)
+            self._session = None
+
+
+def check_google_pull_lease(session: Session) -> None:
+    lease = session.info.get("google_pull_lease")
+    if isinstance(lease, GooglePullLease):
+        lease.check()
 
 
 def release_primary(

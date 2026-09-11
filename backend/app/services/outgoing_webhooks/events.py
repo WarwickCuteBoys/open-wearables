@@ -7,6 +7,8 @@ happens in the worker process.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from typing import Any
@@ -213,6 +215,11 @@ def on_timeseries_batch_saved(
     samples = samples or []
 
     def _emit(event_type: str, payload_data: dict[str, Any], ikey: str) -> None:
+        if series_type in {"energy", "active_energy", "total_energy", "basal_energy"}:
+            revision = hashlib.sha256(
+                json.dumps(payload_data, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()[:24]
+            ikey = f"{ikey}.{revision}"
         _dispatch(
             event_type,
             {"type": event_type, "data": payload_data},
