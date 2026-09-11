@@ -161,6 +161,18 @@ retries). Preserve the returned `run_id` when the historical POST supplies one.
 Existing runs from before this addition may not have `requested_at`; missing
 request metadata is not evidence that data was imported.
 
+During a worker-first rolling upgrade, tasks from legacy API/beat producers
+have no admitted run identity. New workers keep their contention retries on the
+legacy eight-argument task contract, without adding identity/admission kwargs
+that old workers would reject. These retries remain explicitly untracked:
+waiting metadata reports `request_tracking=false` and
+`retry_identity_preserved=false`, and their run IDs are attempt-local.
+Newly admitted requests retain the complete stable-identity retry contract and
+report `retry_identity_preserved=true` when waiting. Deploy all workers to the
+new version before enabling new API/beat producers that can enqueue tracked
+tasks. This wire compatibility does not establish API in-flight request drain
+or change legacy lock expiry/recovery rules.
+
 An importing application should mark data imported only after the corresponding
 signed `sync.completed` event for that exact run has been imported, according to
 its own success/partial-result policy. Neither a queued response, waiting retry,

@@ -91,6 +91,11 @@ def sync_vendor_data(
     Returns:
         dict with sync results per provider
     """
+    # Freeze the incoming wire format before generating a local run identity.
+    # During worker-first rolling releases, old consumers may receive this retry.
+    preserve_retry_identity = (
+        _run_id is not None or _task_id is not None or _requested_at is not None or _history_request
+    )
     factory = ProviderFactory()
     user_connection_repo = UserConnectionRepository()
     provider_settings_repo = ProviderSettingsRepository()
@@ -278,21 +283,25 @@ def sync_vendor_data(
                                 try:
                                     if _history_request:
                                         google_history.wait_for_retry(user_uuid, run_id, _google_lock_retry, countdown)
+                                    retry_kwargs: dict[str, Any] = {
+                                        "user_id": user_id,
+                                        "start_date": start_date,
+                                        "end_date": end_date,
+                                        "providers": ["google"],
+                                        "is_historical": is_historical,
+                                        "_google_lock_retry": _google_lock_retry + 1,
+                                        "_skip_linked_fan_out": _skip_linked_fan_out,
+                                        "_linked_primary_user_id": _linked_primary_user_id,
+                                    }
+                                    if preserve_retry_identity:
+                                        retry_kwargs.update(
+                                            _run_id=run_id,
+                                            _task_id=task_id,
+                                            _requested_at=_requested_at,
+                                            _history_request=_history_request,
+                                        )
                                     sync_vendor_data.apply_async(
-                                        kwargs={
-                                            "user_id": user_id,
-                                            "start_date": start_date,
-                                            "end_date": end_date,
-                                            "providers": ["google"],
-                                            "is_historical": is_historical,
-                                            "_google_lock_retry": _google_lock_retry + 1,
-                                            "_skip_linked_fan_out": _skip_linked_fan_out,
-                                            "_linked_primary_user_id": _linked_primary_user_id,
-                                            "_run_id": run_id,
-                                            "_task_id": task_id,
-                                            "_requested_at": _requested_at,
-                                            "_history_request": _history_request,
-                                        },
+                                        kwargs=retry_kwargs,
                                         task_id=task_id,
                                         countdown=countdown,
                                     )
@@ -321,6 +330,7 @@ def sync_vendor_data(
                                         **run_metadata,
                                         "waiting_for_lock": True,
                                         "retry_after_seconds": countdown,
+                                        "retry_identity_preserved": preserve_retry_identity,
                                     },
                                 )
                             else:

@@ -1,4 +1,5 @@
 import importlib
+import inspect
 import json
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,19 @@ END = datetime(2026, 9, 11, 8, tzinfo=timezone.utc)
 CLUSTER = "arn:aws:ecs:ap-southeast-1:123456789012:cluster/gateway-test"
 CURRENT = "arn:aws:ecs:ap-southeast-1:123456789012:task/gateway-test/" + "a" * 32
 OWNER = "arn:aws:ecs:ap-southeast-1:123456789012:task/gateway-test/" + "b" * 32
+
+
+def _legacy_sync_vendor_data(
+    user_id: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    providers: list[str] | None = None,
+    is_historical: bool = False,
+    _skip_linked_fan_out: bool = False,
+    _linked_primary_user_id: str | None = None,
+    _google_lock_retry: int = 0,
+) -> None:
+    """The ca7c5ef task signature, used only to bind compatibility payloads."""
 
 
 def expire_request(user: UUID, run_id: str) -> None:
@@ -172,6 +186,50 @@ def test_redis_coordination_failure_never_enqueues_untracked_worker() -> None:
     celery.send_task.assert_not_called()
 
 
+@pytest.mark.parametrize("is_historical", [False, True])
+@pytest.mark.parametrize("linked", [False, True])
+def test_legacy_retries_bind_to_old_worker_signature(db: Session, is_historical: bool, linked: bool) -> None:
+    user = UserFactory()
+    user_id = UUID(str(user.id))
+    connection = UserConnectionFactory(user=user, provider="google", provider_user_id="account", last_synced_at=END)
+    task = importlib.import_module(TASK_MODULE).sync_vendor_data
+    legacy_signature = inspect.signature(_legacy_sync_vendor_data)
+    original = {
+        "user_id": str(user_id),
+        "start_date": (END - timedelta(days=8)).isoformat(),
+        "end_date": END.isoformat(),
+        "providers": ["google"],
+        "is_historical": is_historical,
+        "_skip_linked_fan_out": linked,
+        "_linked_primary_user_id": str(uuid4()) if linked else None,
+        "_google_lock_retry": 0,
+    }
+    with (
+        patch(f"{TASK_MODULE}.SessionLocal") as session,
+        patch(f"{TASK_MODULE}.try_become_primary", return_value=(False, "", uuid4())),
+        patch.object(task, "apply_async") as enqueue,
+        patch.object(google_history, "wait_for_retry") as admission_retry,
+    ):
+        session.return_value.__enter__.return_value = db
+        incoming = original
+        for attempt in range(2):
+            task(**incoming)
+            retry = enqueue.call_args.kwargs["kwargs"]
+            bound = legacy_signature.bind(**retry)
+            assert set(bound.arguments) == set(legacy_signature.parameters)
+            assert retry == {**original, "_google_lock_retry": attempt + 1}
+            assert enqueue.call_args.kwargs["countdown"] == 60 * (2**attempt)
+            incoming = retry
+        admission_retry.assert_not_called()
+    assert get_redis_client().hlen(google_history.pending_key(user_id)) == 0
+    for summary in sync_status_service.get_run_summaries(user_id):
+        assert summary.metadata["request_tracking"] is False
+        assert summary.metadata["retry_identity_preserved"] is False
+        assert summary.metadata["waiting_for_lock"] is True
+    db.refresh(connection)
+    assert connection.last_synced_at == END
+
+
 @pytest.mark.parametrize("schedule_error", [False, True])
 def test_waiting_retry_keeps_identity_dates_source_and_cursor(db: Session, schedule_error: bool) -> None:
     user = UserFactory()
@@ -219,16 +277,20 @@ def test_waiting_retry_keeps_identity_dates_source_and_cursor(db: Session, sched
             assert summary.status == "in_progress"
             assert summary.stage == "queued"
             assert summary.metadata["waiting_for_lock"] is True
+            assert summary.metadata["retry_identity_preserved"] is True
             assert summary.metadata["retry_after_seconds"] == 60
             retry_kwargs = enqueue.call_args.kwargs["kwargs"]
             assert retry_kwargs["_run_id"] == request.run_id
             assert retry_kwargs["_requested_at"] == request.requested_at
+            assert retry_kwargs["_task_id"] == request.task_id
+            assert retry_kwargs["_history_request"] is True
             assert enqueue.call_args.kwargs["task_id"] == request.task_id
             task(**retry_kwargs)
             summary = sync_status_service.get_run_summaries(user_id)[0]
             assert summary.run_id == request.run_id
             assert summary.metadata["retry_after_seconds"] == 120
             assert summary.metadata["requested_at"] == request.requested_at
+            assert summary.metadata["retry_identity_preserved"] is True
         steal.assert_not_called()
         strategy.data_247.load_and_save_all.assert_not_called()
     for event in sync_status_service.get_recent_events(user_id):
