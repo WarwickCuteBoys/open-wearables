@@ -98,3 +98,4 @@ class SyncRunSummary(BaseModel):
     started_at: datetime | None = None
     ended_at: datetime | None = None
     last_update: datetime
+    metadata: dict[str, Any] = Field(default_factory=dict)

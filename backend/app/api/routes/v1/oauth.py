@@ -105,6 +105,8 @@ def oauth_callback(
             from app.integrations.celery.tasks import start_garmin_full_backfill
 
             start_garmin_full_backfill.delay(str(oauth_state.user_id))
+        elif caps.rest_pull and provider == ProviderName.GOOGLE:
+            strategy.start_historical_sync(oauth_state.user_id, days=90)
         elif caps.rest_pull:
             from app.integrations.celery.tasks import sync_vendor_data
 

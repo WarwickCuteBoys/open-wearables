@@ -86,6 +86,152 @@ retries deduplicate, but a revised value or interval is delivered again.
 An enabled outgoing webhook destination and its matching signing key are still
 required. Running Svix alone does not configure delivery to a consuming app.
 
+### Trackable reconnect and historical requests
+
+`POST /api/v1/google/users/{user_id}/sync/historical?days=8` keeps its existing
+response fields and adds `run_id`, `requested_at`, and `coalesced` for Google:
+
+```json
+{
+  "success": true,
+  "provider": "google",
+  "user_id": "11111111-2222-4333-8444-555555555555",
+  "method": "pull_api",
+  "task_id": "22222222-3333-4444-8555-666666666666",
+  "run_id": "pull_0123456789abcdef0123456789abcdef",
+  "requested_at": "2026-09-11T08:00:24.123456+00:00",
+  "coalesced": false,
+  "days": 8,
+  "start_date": "2026-09-03T08:00:00+00:00",
+  "end_date": "2026-09-11T08:00:00+00:00",
+  "message": "Historical sync queued."
+}
+```
+
+Requests use a UTC minute-aligned snapshot, excluding the incomplete current
+minute. Redis atomically coalesces a request only when the same gateway user's
+pending Google run contains its entire requested interval. A wider interval
+gets a new job; a narrower request reuses the original run, task, days, and date
+range. No second worker is enqueued for a coalesced request. Automatic
+Google history on OAuth connect uses the same admission path. Reauthorization
+preserves an existing Google live cursor; historical pulls never advance it.
+Other providers retain their existing enqueue behavior.
+
+Read `GET /api/v1/users/{user_id}/sync/runs` and match **both `run_id` and
+`provider`**, not the latest historical run. `SyncRunSummary.metadata` now
+includes the requested date range, `is_historical`, `task_id`, and tracking
+information. When another Google owner holds the lease, retries keep the same
+run and task IDs, dates, and source:
+
+```json
+{
+  "stage": "queued",
+  "status": "in_progress",
+  "metadata": {
+    "waiting_for_lock": true,
+    "retry_after_seconds": 60,
+    "is_historical": true,
+    "request_tracking": true
+  }
+}
+```
+
+The actual summary also contains its normal run/provider/source/timestamp fields.
+Retry delays are 60, 120, 240, 480, and 900 seconds. Scheduling failures and
+exhaustion are terminal failures, not successful imports. A failed terminal run
+allows a new explicit request immediately. Celery `SUCCESS` only means the
+function returned; it says nothing about provider delivery.
+
+Admission and the initial run record are atomic in Redis. Undelivered jobs expire
+after five minutes, waiting retries after their countdown plus five minutes,
+and running request admission after two minutes without a renewable ownership
+heartbeat. Expired deliveries cannot resurrect their request. The read-only run
+summary reports `failed` with `metadata.request_liveness_expired=true` when
+admission has expired or disappeared without a terminal event. This diagnostic
+does not fabricate a signed completion event or cancel a worker. An explicit
+retry can safely create a new run; the provider lease still fences writes.
+Redis coordination errors fail closed rather than dispatching untracked work.
+
+`requested_at` is the original admission timestamp, also exposed in
+`SyncRunSummary.metadata`. It does not change on coalescing, retries, progress,
+or completion. To prefer requested historical work over unrelated live pulls,
+filter for `provider=google`, `source=backfill`, and `metadata.is_historical=true`,
+then select by `metadata.requested_at`, not `last_update` (which changes during
+retries). Preserve the returned `run_id` when the historical POST supplies one.
+Existing runs from before this addition may not have `requested_at`; missing
+request metadata is not evidence that data was imported.
+
+During a worker-first rolling upgrade, tasks from legacy API/beat producers
+have no admitted run identity. New workers keep their contention retries on the
+legacy eight-argument task contract, without adding identity/admission kwargs
+that old workers would reject. These retries remain explicitly untracked:
+waiting metadata reports `request_tracking=false` and
+`retry_identity_preserved=false`, and their run IDs are attempt-local.
+Newly admitted requests retain the complete stable-identity retry contract and
+report `retry_identity_preserved=true` when waiting. Deploy all workers to the
+new version before enabling new API/beat producers that can enqueue tracked
+tasks. This wire compatibility does not establish API in-flight request drain
+or change legacy lock expiry/recovery rules.
+
+An importing application should mark data imported only after the corresponding
+signed `sync.completed` event for that exact run has been imported, according to
+its own success/partial-result policy. Neither a queued response, waiting retry,
+OAuth success nor a Celery result proves import completion.
+The outgoing envelope is `{"type":"sync.completed","data":{...}}`: the exact
+admitted ID is `data.run_id`, with `data.provider`, `data.source`, `data.status`,
+and `data.metadata`. Partial completion remains `data.status="partial"` and
+summary `status="partial"`; it is never promoted to success. The Svix
+idempotency key is `sync.completed.<run_id>`.
+
+### Read-only Google lease inspection and stopped-owner recovery
+
+Run the operator CLI from `backend/` inside an authorized gateway ECS container:
+
+```bash
+python -m scripts.google_sync_lock --user-id 11111111-2222-4333-8444-555555555555
+```
+
+It resolves the active Google provider account internally using the gateway UUID.
+Output is concise JSON: `ttl_seconds`, SHA256 `owner_fingerprint`, token-bound
+run/task/process/container/ECS metadata, and `ownership_verifiable`. It never
+prints OAuth credentials, the provider account identifier, or the raw owner
+token. Ordinary inspection only reads Redis, the database, ECS local task
+metadata, and `ecs:DescribeTasks`.
+
+Outside ECS, all four explicit environment checks are required:
+
+```bash
+python -m scripts.google_sync_lock \
+  --user-id 11111111-2222-4333-8444-555555555555 \
+  --cluster-arn arn:aws:ecs:ap-southeast-1:123456789012:cluster/gateway-test \
+  --current-task-arn arn:aws:ecs:ap-southeast-1:123456789012:task/gateway-test/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --expected-redis-host redis.gateway.internal \
+  --expected-database-host postgres.gateway.internal
+```
+
+Both storage hosts must match the configured gateway, and the inspecting ECS task
+must be `RUNNING` in the exact region/account/cluster. Inside ECS, explicit ARNs
+must also match the local container metadata. Operators are responsible for
+selecting the authorized gateway environment and UUID; possession of a UUID is
+not authentication.
+
+Recovery is never automatic. Repeat inspection with `--recover` and
+`--expected-fingerprint` set to the full 64-character fingerprint just inspected.
+The CLI must establish token-bound owner evidence, verify the exact owning task
+is `STOPPED` in the same cluster via read-only `DescribeTasks`, and atomically
+compare-delete the observed Redis owner and its unchanged evidence. A changed
+owner, expired/missing evidence, missing ECS task, denied AWS lookup, or live task
+refuses recovery. The user's inactive connection and elapsed time are never proof
+of abandoned ownership. Legacy locks have no ownership evidence and require
+natural expiry; they cannot be stolen by this CLI or the Google worker.
+
+The only additional gateway-role permission needed is `ecs:DescribeTasks`,
+scoped to the gateway cluster's task ARNs (and optionally its `ecs:cluster`
+condition). No `ecs:StopTask`, service updates, queue purge, cancellation, broad
+Redis deletion, or database writes are part of this tool. Recovery releases only
+the proven stopped owner's lock; request status and new explicit retries remain
+separate operations.
+
 ## Data granularity and fetch modes
 
 The Health API exposes the same underlying data through three different operations. Open Wearables picks one per the `DEFAULT_DATA_GRANULARITY` setting, and — at the finest granularity — the `GOOGLE_USE_RECONCILE` flag.

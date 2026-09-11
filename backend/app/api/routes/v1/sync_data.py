@@ -384,6 +384,8 @@ def sync_historical_data(
         "method": result.method,
         "task_id": result.task_id,
         "message": result.message,
+        **({"run_id": result.run_id, "coalesced": result.coalesced} if result.run_id is not None else {}),
+        **({"requested_at": result.requested_at} if result.requested_at is not None else {}),
         **({"days": result.days} if result.days is not None else {}),
         **({"start_date": result.start_date} if result.start_date is not None else {}),
         **({"end_date": result.end_date} if result.end_date is not None else {}),
