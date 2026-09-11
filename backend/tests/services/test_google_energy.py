@@ -649,8 +649,11 @@ def test_google_lock_contention_does_not_advance_cursor_and_retries_are_bounded(
     assert connection.last_synced_at == LOW
     assert result["providers_synced"]["google"]["success"] is False
     assert enqueue.call_count == (1 if retry < 5 else 0)
-    failed_status.assert_called_once()
-    assert "error" in failed_status.call_args.kwargs
+    if retry < 5:
+        failed_status.assert_not_called()
+    else:
+        failed_status.assert_called_once()
+        assert "error" in failed_status.call_args.kwargs
 
 
 def test_google_failed_energy_pull_retains_live_cursor(db: Session) -> None:

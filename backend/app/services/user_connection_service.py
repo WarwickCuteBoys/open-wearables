@@ -111,10 +111,11 @@ class UserConnectionService(
 
         Used after OAuth completion so the first periodic sync uses the connection
         timestamp as its live-sync cursor and won't attempt to pull all historical data.
+        Google reconnects preserve an existing cursor: authorization is not data delivery.
         No-op if the connection does not exist.
         """
         connection = self.crud.get_by_user_and_provider(db_session, user_id, provider)
-        if connection:
+        if connection and not (provider == "google" and connection.last_synced_at is not None):
             self.crud.update_last_synced_at(db_session, connection)
 
     def _deregister_from_provider(

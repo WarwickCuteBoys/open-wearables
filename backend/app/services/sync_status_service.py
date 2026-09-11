@@ -39,6 +39,7 @@ from app.schemas.sync_status import (
     SyncStatus,
     SyncStatusEvent,
 )
+from app.services import google_history
 from app.utils.sse import format_comment, format_event
 from app.utils.structured_logging import log_structured
 
@@ -281,6 +282,23 @@ def get_run_summaries(user_id: str | UUID, limit: int = 20) -> list[SyncRunSumma
             continue
         with suppress(ValueError, TypeError):
             event = SyncStatusEvent.model_validate_json(item)
+            if event.user_id != UUID(str(user_id)):
+                continue
+            if (
+                event.provider == "google"
+                and event.status == SyncStatus.IN_PROGRESS
+                and event.metadata.get("request_tracking")
+                and not google_history.remaining(user_id, event.run_id)
+            ):
+                event = event.model_copy(
+                    update={
+                        "stage": SyncStage.FAILED,
+                        "status": SyncStatus.FAILED,
+                        "error": "Historical request liveness expired; explicit retry required",
+                        "message": "No verified active historical request remains",
+                        "metadata": {**event.metadata, "request_liveness_expired": True, "waiting_for_lock": False},
+                    }
+                )
             summaries.append(
                 SyncRunSummary(
                     run_id=event.run_id,
@@ -298,6 +316,7 @@ def get_run_summaries(user_id: str | UUID, limit: int = 20) -> list[SyncRunSumma
                     ended_at=event.ended_at,
                     primary_user_id=event.primary_user_id,
                     last_update=event.timestamp,
+                    metadata=event.metadata,
                 )
             )
 
@@ -408,6 +427,27 @@ def stream_user_events(
 # ---------------------------------------------------------------------------
 # Convenience helpers for common state transitions
 # ---------------------------------------------------------------------------
+
+
+def queued(
+    user_id: str | UUID,
+    provider: str,
+    source: SyncSource | str,
+    *,
+    run_id: str,
+    message: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> SyncStatusEvent:
+    return emit_event(
+        user_id=user_id,
+        provider=provider,
+        source=source,
+        run_id=run_id,
+        stage=SyncStage.QUEUED,
+        status=SyncStatus.IN_PROGRESS,
+        message=message,
+        metadata=metadata,
+    )
 
 
 def started(

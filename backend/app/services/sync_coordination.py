@@ -17,6 +17,7 @@ Redis keys (scoped to provider + provider_user_id + scope):
 *scope* separates concurrent sync types, e.g. "pull" vs "backfill".
 """
 
+import json
 import logging
 import threading
 from uuid import UUID, uuid4
@@ -25,6 +26,8 @@ from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 from app.integrations.redis_client import get_redis_client
+from app.services import google_history
+from app.services.google_sync_owner import fingerprint, metadata_key, owner_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -96,9 +99,23 @@ class SyncLeaseLostError(RuntimeError):
 
 
 class GooglePullLease:
-    def __init__(self, provider_user_id: str, user_id: UUID, token: str) -> None:
+    def __init__(
+        self,
+        provider_user_id: str,
+        user_id: UUID,
+        token: str,
+        *,
+        run_id: str | None = None,
+        task_id: str | None = None,
+        history_attempt: int | None = None,
+    ) -> None:
         self.key = _primary_key("google", provider_user_id, "pull")
         self.value = f"{user_id}:{token}"
+        self.metadata_key = metadata_key(self.key, self.value)
+        self.user_id = user_id
+        self.run_id = run_id
+        self.task_id = task_id
+        self.history_attempt = history_attempt
         self._stop = threading.Event()
         self._lost = threading.Event()
         self._thread: threading.Thread | None = None
@@ -108,11 +125,19 @@ class GooglePullLease:
         if self._lost.is_set():
             raise SyncLeaseLostError("Google sync lease was lost; refusing further writes")
         try:
+            if (
+                self.history_attempt is not None
+                and self.run_id is not None
+                and not google_history.heartbeat(self.user_id, self.run_id, self.history_attempt)
+            ):
+                raise SyncLeaseLostError("Google historical request liveness expired")
             renewed = get_redis_client().eval(
                 "if redis.call('get',KEYS[1]) == ARGV[1] then "
+                "redis.call('expire',KEYS[2],ARGV[2]); "
                 "return redis.call('expire',KEYS[1],ARGV[2]) else return 0 end",
-                1,
+                2,
                 self.key,
+                self.metadata_key,
                 self.value,
                 GOOGLE_PULL_LEASE_SECONDS,
             )
@@ -133,6 +158,20 @@ class GooglePullLease:
 
     def start(self, session: Session) -> None:
         self.check()
+        metadata = owner_metadata(self.run_id, self.task_id)
+        metadata["owner_fingerprint"] = fingerprint(self.value)
+        recorded = get_redis_client().eval(
+            "if redis.call('get',KEYS[1]) == ARGV[1] then "
+            "redis.call('set',KEYS[2],ARGV[2],'EX',ARGV[3]); return 1 else return 0 end",
+            2,
+            self.key,
+            self.metadata_key,
+            self.value,
+            json.dumps(metadata),
+            GOOGLE_PULL_LEASE_SECONDS,
+        )
+        if not recorded:
+            raise SyncLeaseLostError("Google lease changed before ownership evidence could be recorded")
         self._session = session
         session.info["google_pull_lease"] = self
         event.listen(session, "before_commit", self.check)
@@ -271,4 +310,6 @@ def release_stale_primary(
     revoked) so the lock would never be released naturally before TTL expiry.
     Returns True when the key was deleted.
     """
+    if provider == "google":
+        raise ValueError("Google owners require verified ECS recovery or natural expiry")
     return bool(get_redis_client().delete(_primary_key(provider, provider_user_id, scope)))

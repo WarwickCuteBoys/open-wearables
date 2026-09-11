@@ -13,11 +13,14 @@ from app.repositories.user_repository import UserRepository
 from app.schemas.auth import LiveSyncMode
 from app.schemas.enums import SeriesType
 from app.schemas.enums.health_score_category import HealthScoreCategory
+from app.schemas.sync_status import SyncSource
+from app.services import google_history
 from app.services.providers.templates.base_247_data import Base247DataTemplate
 from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.services.providers.templates.base_webhook_handler import BaseWebhookHandler
 from app.services.providers.templates.base_webhook_service import BaseWebhookService
 from app.services.providers.templates.base_workouts import BaseWorkoutsTemplate
+from app.services.sync_status_service import failed, queued
 from app.utils.exceptions import UnsupportedProviderError
 
 
@@ -31,6 +34,9 @@ class HistoricalSyncResult:
     days: int | None
     start_date: str | None = None
     end_date: str | None = None
+    run_id: str | None = None
+    requested_at: str | None = None
+    coalesced: bool = False
 
 
 @dataclass(frozen=True)
@@ -195,7 +201,63 @@ class BaseProviderStrategy(ABC):
             raise UnsupportedProviderError(self.name, "historical sync")
 
         end_date = datetime.now(timezone.utc)
+        if self.name == "google":
+            # A recent-history request is a minute-aligned snapshot, not a moving
+            # endpoint that would defeat containment on every reconnect tap.
+            end_date = end_date.replace(second=0, microsecond=0)
         start_date = end_date - timedelta(days=days)
+
+        if self.name == "google":
+            request, created = google_history.reserve(user_id, start_date, end_date, days)
+            if created:
+                metadata = {
+                    "is_historical": True,
+                    "request_tracking": True,
+                    "start_date": request.start_date,
+                    "end_date": request.end_date,
+                    "task_id": request.task_id,
+                    "requested_at": request.requested_at,
+                    "waiting_for_lock": False,
+                }
+                try:
+                    queued(user_id, self.name, SyncSource.BACKFILL, run_id=request.run_id, metadata=metadata)
+                    celery_app.send_task(
+                        "app.integrations.celery.tasks.sync_vendor_data_task.sync_vendor_data",
+                        task_id=request.task_id,
+                        kwargs={
+                            "user_id": str(user_id),
+                            "start_date": request.start_date,
+                            "end_date": request.end_date,
+                            "providers": [self.name],
+                            "is_historical": True,
+                            "_run_id": request.run_id,
+                            "_history_request": True,
+                            "_task_id": request.task_id,
+                            "_requested_at": request.requested_at,
+                        },
+                    )
+                except Exception:
+                    failed(
+                        user_id,
+                        self.name,
+                        SyncSource.BACKFILL,
+                        run_id=request.run_id,
+                        error="Historical request could not be enqueued",
+                        metadata=metadata,
+                    )
+                    google_history.finish(user_id, request.run_id)
+                    raise
+            return HistoricalSyncResult(
+                task_id=request.task_id,
+                run_id=request.run_id,
+                requested_at=request.requested_at,
+                coalesced=not created,
+                method="pull_api",
+                message="Historical sync queued." if created else "Existing historical sync covers this request.",
+                days=request.days,
+                start_date=request.start_date,
+                end_date=request.end_date,
+            )
 
         task = celery_app.send_task(
             "app.integrations.celery.tasks.sync_vendor_data_task.sync_vendor_data",

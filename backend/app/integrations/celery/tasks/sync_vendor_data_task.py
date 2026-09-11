@@ -13,6 +13,7 @@ from app.repositories.user_connection_repository import UserConnectionRepository
 from app.schemas.auth import LiveSyncMode
 from app.schemas.responses.upload import ProviderSyncResult, SyncVendorDataResult
 from app.schemas.sync_status import SyncSource, SyncStage, SyncStatus
+from app.services import google_history
 from app.services.providers.factory import ProviderFactory
 from app.services.sync_coordination import (
     GooglePullLease,
@@ -21,7 +22,7 @@ from app.services.sync_coordination import (
     release_stale_primary,
     try_become_primary,
 )
-from app.services.sync_status_service import completed, failed, new_run_id, progress, started
+from app.services.sync_status_service import completed, failed, new_run_id, progress, queued, started
 from app.utils.config_utils import format_duration
 from app.utils.context import trace_id_var
 from app.utils.sentry_helpers import log_and_capture_error
@@ -67,6 +68,10 @@ def sync_vendor_data(
     _skip_linked_fan_out: bool = False,
     _linked_primary_user_id: str | None = None,
     _google_lock_retry: int = 0,
+    _run_id: str | None = None,
+    _task_id: str | None = None,
+    _requested_at: str | None = None,
+    _history_request: bool = False,
 ) -> dict[str, Any]:
     """
     Synchronize workout/exercise/activity data from all providers the user is connected to.
@@ -121,6 +126,18 @@ def sync_vendor_data(
         end_date=end_date,
     )
 
+    if _history_request:
+        if not _run_id or providers != ["google"] or not is_historical:
+            raise ValueError("Tracked history requires a single Google historical run")
+        if not google_history.claim(user_uuid, _run_id, _google_lock_retry):
+            result.errors["google"] = "Historical delivery expired or already claimed; no work performed"
+            return result.model_dump()
+
+    google_source = (
+        SyncSource.LINKED_ACCOUNT
+        if _linked_primary_user_id
+        else (SyncSource.BACKFILL if is_historical else SyncSource.PULL)
+    )
     with SessionLocal() as db:
         try:
             connections = user_connection_repo.get_all_active_by_user(db, user_uuid)
@@ -155,6 +172,25 @@ def sync_vendor_data(
                     user_id=user_id,
                 )
                 result.message = "No active provider connections found"
+                if _run_id and providers == ["google"]:
+                    _emit_sync_status(
+                        failed,
+                        user_uuid,
+                        "google",
+                        google_source,
+                        run_id=_run_id,
+                        error=result.message,
+                        metadata={
+                            "is_historical": is_historical,
+                            "request_tracking": _history_request,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "task_id": _task_id,
+                            "requested_at": _requested_at,
+                        },
+                    )
+                    if _history_request:
+                        google_history.finish(user_uuid, _run_id)
                 return result.model_dump()
 
             log_structured(
@@ -176,7 +212,22 @@ def sync_vendor_data(
                     user_id=user_id,
                 )
 
-                run_id = new_run_id(prefix="pull")
+                run_id = (
+                    (_run_id or new_run_id(prefix="pull")) if provider_name == "google" else new_run_id(prefix="pull")
+                )
+                if provider_name == "google":
+                    _run_id = run_id
+                task_id = _task_id or sync_vendor_data.request.id or str(uuid4())
+                run_metadata = {
+                    "trace_id": trace_id,
+                    "is_historical": is_historical,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "task_id": task_id,
+                    "requested_at": _requested_at,
+                    "request_tracking": _history_request,
+                    "waiting_for_lock": False,
+                }
                 primary_uuid: UUID | None = None
                 if _linked_primary_user_id:
                     with suppress(ValueError):
@@ -196,7 +247,7 @@ def sync_vendor_data(
                     is_pull_primary, shared_token, existing_primary = try_become_primary(
                         provider_name, connection.provider_user_id, user_uuid, scope="pull"
                     )
-                    if not is_pull_primary and existing_primary:
+                    if provider_name != "google" and not is_pull_primary and existing_primary:
                         # If the lock holder no longer has an active connection (e.g. user
                         # deleted), the lock is stale and will never be released naturally.
                         # Steal it so this profile can become primary.
@@ -220,25 +271,36 @@ def sync_vendor_data(
                         if provider_name == "google":
                             # Historical and live pulls share this lock, even for the same
                             # profile. A skip cannot advance the live cursor or claim delivery.
+                            deferred = False
+                            countdown = min(60 * (2**_google_lock_retry), 900)
+                            message = "Google pull lock retries exhausted; cursor unchanged"
                             if _google_lock_retry < 5:
-                                sync_vendor_data.apply_async(
-                                    kwargs={
-                                        "user_id": user_id,
-                                        "start_date": start_date,
-                                        "end_date": end_date,
-                                        "providers": ["google"],
-                                        "is_historical": is_historical,
-                                        "_google_lock_retry": _google_lock_retry + 1,
-                                        "_skip_linked_fan_out": _skip_linked_fan_out,
-                                        "_linked_primary_user_id": _linked_primary_user_id,
-                                    },
-                                    countdown=min(60 * (2**_google_lock_retry), 900),
-                                )
-                            message = (
-                                "Google pull deferred behind an active pull"
-                                if _google_lock_retry < 5
-                                else "Google pull lock retries exhausted; cursor unchanged"
-                            )
+                                try:
+                                    if _history_request:
+                                        google_history.wait_for_retry(user_uuid, run_id, _google_lock_retry, countdown)
+                                    sync_vendor_data.apply_async(
+                                        kwargs={
+                                            "user_id": user_id,
+                                            "start_date": start_date,
+                                            "end_date": end_date,
+                                            "providers": ["google"],
+                                            "is_historical": is_historical,
+                                            "_google_lock_retry": _google_lock_retry + 1,
+                                            "_skip_linked_fan_out": _skip_linked_fan_out,
+                                            "_linked_primary_user_id": _linked_primary_user_id,
+                                            "_run_id": run_id,
+                                            "_task_id": task_id,
+                                            "_requested_at": _requested_at,
+                                            "_history_request": _history_request,
+                                        },
+                                        task_id=task_id,
+                                        countdown=countdown,
+                                    )
+                                    deferred = True
+                                    message = "Google pull waiting for another owner; retry scheduled"
+                                except Exception as exc:
+                                    message = "Google pull retry could not be scheduled"
+                                    log_and_capture_error(exc, logger, message, extra={"run_id": run_id})
                             log_structured(
                                 logger,
                                 "warning",
@@ -247,17 +309,35 @@ def sync_vendor_data(
                                 user_id=user_id,
                                 retry=_google_lock_retry,
                             )
-                            _emit_sync_status(
-                                failed,
-                                user_uuid,
-                                provider_name,
-                                sync_source,
-                                run_id=run_id,
-                                error=message,
-                                message=message,
-                            )
+                            if deferred:
+                                _emit_sync_status(
+                                    queued,
+                                    user_uuid,
+                                    provider_name,
+                                    sync_source,
+                                    run_id=run_id,
+                                    message=message,
+                                    metadata={
+                                        **run_metadata,
+                                        "waiting_for_lock": True,
+                                        "retry_after_seconds": countdown,
+                                    },
+                                )
+                            else:
+                                _emit_sync_status(
+                                    failed,
+                                    user_uuid,
+                                    provider_name,
+                                    sync_source,
+                                    run_id=run_id,
+                                    error=message,
+                                    message=message,
+                                    metadata=run_metadata,
+                                )
+                                if _history_request:
+                                    google_history.finish(user_uuid, run_id)
                             result.providers_synced[provider_name] = ProviderSyncResult(
-                                success=False, params={"deferred": _google_lock_retry < 5, "error": message}
+                                success=False, params={"deferred": deferred, "message": message, "run_id": run_id}
                             )
                             continue
                         log_structured(
@@ -292,18 +372,22 @@ def sync_vendor_data(
                         else f"Live sync from {provider_name} started"
                     ),
                     primary_user_id=primary_uuid,
-                    metadata={
-                        "trace_id": trace_id,
-                        "is_historical": is_historical,
-                        "start_date": start_date,
-                        "end_date": end_date,
-                    },
+                    metadata=run_metadata,
                 )
 
                 lease: GooglePullLease | None = None
                 try:
+                    if provider_name == "google" and _history_request and not connection.provider_user_id:
+                        raise ValueError("Google historical sync requires a provider account identity")
                     if provider_name == "google" and shared_token and connection.provider_user_id:
-                        lease = GooglePullLease(connection.provider_user_id, user_uuid, shared_token)
+                        lease = GooglePullLease(
+                            connection.provider_user_id,
+                            user_uuid,
+                            shared_token,
+                            run_id=run_id,
+                            task_id=task_id,
+                            history_attempt=_google_lock_retry if _history_request else None,
+                        )
                         lease.start(db)
                     strategy = factory.get_provider(provider_name)
                     provider_result = ProviderSyncResult(success=True, params={})
@@ -348,6 +432,7 @@ def sync_vendor_data(
                             run_id=run_id,
                             stage=SyncStage.FETCHING,
                             message=f"Fetching workouts from {provider_name}",
+                            metadata=run_metadata,
                         )
                         try:
                             success = strategy.workouts.load_data(db, user_uuid, **params)
@@ -396,6 +481,7 @@ def sync_vendor_data(
                             run_id=run_id,
                             stage=SyncStage.FETCHING,
                             message=f"Fetching 24/7 data (sleep / recovery / activity) from {provider_name}",
+                            metadata=run_metadata,
                         )
 
                         try:
@@ -536,14 +622,14 @@ def sync_vendor_data(
                             error="All sync sub-tasks failed",
                             message=f"Sync from {provider_name} failed",
                             primary_user_id=primary_uuid,
-                            metadata={"is_historical": is_historical, "params": provider_result.params},
+                            metadata={**run_metadata, "params": provider_result.params},
                         )
                     else:
                         # inserted/updated are run-level totals across all timeseries
                         # types: a single sync (historical included) can have both —
                         # e.g. new days inserted while overlapping days are refreshed.
                         completed_metadata: dict[str, Any] = {
-                            "is_historical": is_historical,
+                            **run_metadata,
                             "params": provider_result.params,
                         }
                         completed_message = (
@@ -571,6 +657,8 @@ def sync_vendor_data(
                             primary_user_id=primary_uuid,
                             metadata=completed_metadata,
                         )
+                    if _history_request:
+                        google_history.finish(user_uuid, run_id)
 
                 except Exception as e:
                     db.rollback()
@@ -588,8 +676,10 @@ def sync_vendor_data(
                         run_id=run_id,
                         error=str(e),
                         message=f"Sync from {provider_name} failed",
-                        metadata={"is_historical": is_historical},
+                        metadata=run_metadata,
                     )
+                    if _history_request:
+                        google_history.finish(user_uuid, run_id)
                     log_and_capture_error(
                         e,
                         logger,
@@ -610,6 +700,25 @@ def sync_vendor_data(
             return result.model_dump()
 
         except Exception as e:
+            if _run_id and providers == ["google"]:
+                _emit_sync_status(
+                    failed,
+                    user_uuid,
+                    "google",
+                    google_source,
+                    run_id=_run_id,
+                    error="Google request processing failed",
+                    metadata={
+                        "is_historical": is_historical,
+                        "request_tracking": _history_request,
+                        "start_date": start_date,
+                        "end_date": end_date,
+                        "task_id": _task_id,
+                        "requested_at": _requested_at,
+                    },
+                )
+                if _history_request:
+                    google_history.finish(user_uuid, _run_id)
             log_and_capture_error(
                 e,
                 logger,
