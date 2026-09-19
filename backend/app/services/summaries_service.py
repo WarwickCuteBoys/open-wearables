@@ -87,6 +87,11 @@ BODY_AVERAGED_SERIES = [
 DEFAULT_AVERAGE_PERIOD_DAYS = 7
 DEFAULT_LATEST_WINDOW_HOURS = 4
 
+# Row cap for the internal sleep lookup get_recovery_summaries() joins onto --
+# one row per (date, provider, device) before priority filtering, so this
+# only becomes a real constraint on a multi-year, multi-device date range.
+_SLEEP_JOIN_ROW_LIMIT = 2000
+
 
 class SummariesService:
     """Service for aggregating daily health summaries."""
@@ -380,6 +385,26 @@ class SummariesService:
             ),
         )
 
+    def _sleep_by_date_for_recovery(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> dict[date, dict]:
+        """One sleep aggregate per date, for joining onto recovery summaries.
+
+        Not paginated the way the public sleep/recovery endpoints are: this is
+        an internal lookup over the same date range the caller already asked
+        for, so a generous fixed limit (comfortably above one row per
+        provider/device per day) is simpler than threading cursors through.
+        """
+        sleep_results = self.event_record_repo.get_sleep_summaries(
+            db_session, user_id, start_date, end_date, cursor=None, limit=_SLEEP_JOIN_ROW_LIMIT
+        )
+        sleep_results = self._filter_by_priority(db_session, user_id, sleep_results, date_key="sleep_date")
+        return {row["sleep_date"]: row for row in sleep_results}
+
     @handle_exceptions
     def get_recovery_summaries(
         self,
@@ -394,6 +419,12 @@ class SummariesService:
 
         Metrics come from the components JSONB stored alongside the recovery score:
         resting_heart_rate, hrv_rmssd_milli, spo2_percentage.
+
+        sleep_duration_seconds/sleep_efficiency_percent are NOT stored on the
+        recovery record itself (Whoop's recovery payload only carries a
+        sleep_id/cycle_id reference, never persisted onto the saved
+        HealthScore) -- so they're filled in here from that date's own sleep
+        summary, the same aggregation get_sleep_summaries() already does.
         """
         results = self.health_score_repo.get_recovery_summaries(
             db_session, user_id, start_date, end_date, cursor, limit
@@ -417,26 +448,33 @@ class SummariesService:
                 first_result = results[0]
                 previous_cursor = encode_cursor(first_result["recorded_at"], first_result["record_id"], "prev")
 
-        data = [
-            RecoverySummary(
-                date=r["recovery_date"],
-                source=SourceMetadata(
-                    provider=r.get("provider") or "unknown",
-                    source=r.get("source"),
-                    device=r.get("device_model"),
-                    device_type=r.get("device_type"),
-                ),
-                sleep_duration_seconds=None,
-                sleep_efficiency_percent=None,
-                resting_heart_rate_bpm=int(r["resting_heart_rate"])
-                if r.get("resting_heart_rate") is not None
-                else None,
-                avg_hrv_rmssd_ms=float(r["hrv_rmssd_milli"]) if r.get("hrv_rmssd_milli") is not None else None,
-                avg_spo2_percent=float(r["spo2_percentage"]) if r.get("spo2_percentage") is not None else None,
-                recovery_score=r.get("recovery_score"),
+        sleep_by_date = self._sleep_by_date_for_recovery(db_session, user_id, start_date, end_date) if results else {}
+
+        data = []
+        for r in results:
+            sleep_row = sleep_by_date.get(r["recovery_date"])
+            sleep_duration_minutes = sleep_row.get("total_duration_minutes") if sleep_row else None
+            data.append(
+                RecoverySummary(
+                    date=r["recovery_date"],
+                    source=SourceMetadata(
+                        provider=r.get("provider") or "unknown",
+                        source=r.get("source"),
+                        device=r.get("device_model"),
+                        device_type=r.get("device_type"),
+                    ),
+                    sleep_duration_seconds=int(round(sleep_duration_minutes * 60))
+                    if sleep_duration_minutes is not None
+                    else None,
+                    sleep_efficiency_percent=sleep_row.get("efficiency_percent") if sleep_row else None,
+                    resting_heart_rate_bpm=int(r["resting_heart_rate"])
+                    if r.get("resting_heart_rate") is not None
+                    else None,
+                    avg_hrv_rmssd_ms=float(r["hrv_rmssd_milli"]) if r.get("hrv_rmssd_milli") is not None else None,
+                    avg_spo2_percent=float(r["spo2_percentage"]) if r.get("spo2_percentage") is not None else None,
+                    recovery_score=r.get("recovery_score"),
+                )
             )
-            for r in results
-        ]
 
         return PaginatedResponse(
             data=data,

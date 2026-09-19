@@ -8,12 +8,13 @@ from uuid import uuid4
 import pytest
 from sqlalchemy.orm import Session
 
-from app.schemas.enums import ProviderName
+from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.services.summaries_service import SummariesService
 from tests.factories import (
     DataPointSeriesFactory,
     DataSourceFactory,
     EventRecordFactory,
+    HealthScoreFactory,
     PersonalRecordFactory,
     SeriesTypeDefinitionFactory,
     SleepDetailsFactory,
@@ -285,7 +286,8 @@ class TestGetRecoverySummaries:
             "spo2_percentage": 98.4,
         }
         monkeypatch.setattr(service.health_score_repo, "get_recovery_summaries", lambda *_: [row])
-        monkeypatch.setattr(service, "_filter_by_priority", lambda *_args, **_kwargs: [row])
+        monkeypatch.setattr(service.event_record_repo, "get_sleep_summaries", lambda *_args, **_kwargs: [])
+        monkeypatch.setattr(service, "_filter_by_priority", lambda _db, _uid, results, **_kwargs: results)
 
         result = service.get_recovery_summaries(
             db_session=None,
@@ -299,6 +301,94 @@ class TestGetRecoverySummaries:
         summary = result.data[0]
         assert summary.avg_hrv_sdnn_ms is None
         assert summary.avg_hrv_rmssd_ms == 63.2
+
+    def test_sleep_fields_stay_none_without_a_matching_sleep_summary(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        user = UserFactory()
+        recovery_ds = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop")
+        HealthScoreFactory(
+            data_source=recovery_ds,
+            user_id=user.id,
+            category=HealthScoreCategory.RECOVERY,
+            provider=ProviderName.WHOOP,
+            value=74,
+            recorded_at=_dt("2026-01-02T08:00:00+00:00"),
+            components={
+                "resting_heart_rate": {"value": 51},
+                "hrv_rmssd_milli": {"value": 63.2},
+                "spo2_percentage": {"value": 98.4},
+            },
+        )
+
+        result = service.get_recovery_summaries(
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-03T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+        )
+
+        assert len(result.data) == 1
+        summary = result.data[0]
+        assert summary.recovery_score == 74
+        assert summary.sleep_duration_seconds is None
+        assert summary.sleep_efficiency_percent is None
+
+    def test_joins_sleep_duration_and_efficiency_from_the_same_dates_sleep_summary(
+        self, db: Session, service: SummariesService
+    ) -> None:
+        # Regression test: Whoop's recovery payload only carries a
+        # sleep_id/cycle_id reference (never persisted onto the saved
+        # HealthScore), so get_recovery_summaries() used to hardcode
+        # sleep_duration_seconds/sleep_efficiency_percent to None for every
+        # record. They should come from that date's own sleep summary.
+        user = UserFactory()
+        recovery_ds = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop")
+        HealthScoreFactory(
+            data_source=recovery_ds,
+            user_id=user.id,
+            category=HealthScoreCategory.RECOVERY,
+            provider=ProviderName.WHOOP,
+            value=74,
+            recorded_at=_dt("2026-01-02T08:00:00+00:00"),
+            components={
+                "resting_heart_rate": {"value": 51},
+                "hrv_rmssd_milli": {"value": 63.2},
+                "spo2_percentage": {"value": 98.4},
+            },
+        )
+        sleep_ds = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source="whoop")
+        sleep_record = EventRecordFactory(
+            data_source=sleep_ds,
+            category="sleep",
+            type="sleep",
+            start_datetime=_dt("2026-01-01T23:00:00+00:00"),
+            end_datetime=_dt("2026-01-02T07:42:00+00:00"),
+            duration_seconds=int((_dt("2026-01-02T07:42:00+00:00") - _dt("2026-01-01T23:00:00+00:00")).total_seconds()),
+            zone_offset="+00:00",
+        )
+        SleepDetailsFactory(
+            event_record=sleep_record,
+            sleep_total_duration_minutes=7 * 60 + 42,
+            sleep_efficiency_score=91,
+        )
+
+        result = service.get_recovery_summaries(
+            db,
+            user.id,
+            _dt("2026-01-01T00:00:00+00:00"),
+            _dt("2026-01-03T00:00:00+00:00"),
+            cursor=None,
+            limit=10,
+        )
+
+        assert len(result.data) == 1
+        summary = result.data[0]
+        assert summary.recovery_score == 74
+        assert summary.sleep_duration_seconds == 7 * 3600 + 42 * 60
+        assert summary.sleep_efficiency_percent == 91
 
 
 # ---------------------------------------------------------------------------
