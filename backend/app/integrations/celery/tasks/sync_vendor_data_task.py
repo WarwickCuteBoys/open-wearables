@@ -58,6 +58,75 @@ def _include_in_periodic_pull(caps: Any, live_sync_mode: LiveSyncMode | None, is
     return live_sync_mode == LiveSyncMode.PULL
 
 
+def _schedule_google_history_retry(
+    user_id: UUID,
+    *,
+    run_id: str,
+    task_id: str,
+    requested_at: str | None,
+    start_date: str | None,
+    end_date: str | None,
+    attempt: int,
+    skip_linked_fan_out: bool,
+    linked_primary_user_id: str | None,
+    error: str,
+) -> bool:
+    if not google_history.heartbeat(user_id, run_id, attempt):
+        return False
+    if attempt + 1 >= google_history.MAX_ATTEMPTS:
+        return False
+
+    retry_after = min(60 * (2 ** min(attempt, 4)), 900)
+    google_history.wait_for_retry(user_id, run_id, attempt, retry_after)
+    metadata = {
+        "is_historical": True,
+        "request_tracking": True,
+        "task_id": task_id,
+        "requested_at": requested_at,
+        "start_date": start_date,
+        "end_date": end_date,
+        "attempt": attempt + 1,
+        "retry_after_seconds": retry_after,
+        "error": error,
+    }
+    _emit_sync_status(
+        queued,
+        user_id,
+        "google",
+        SyncSource.BACKFILL,
+        run_id=run_id,
+        message="Google history sync failed temporarily; retry scheduled",
+        metadata=metadata,
+    )
+    try:
+        sync_vendor_data.apply_async(
+            kwargs={
+                "user_id": str(user_id),
+                "start_date": start_date,
+                "end_date": end_date,
+                "providers": ["google"],
+                "is_historical": True,
+                "_skip_linked_fan_out": skip_linked_fan_out,
+                "_linked_primary_user_id": linked_primary_user_id,
+                "_google_lock_retry": attempt + 1,
+                "_run_id": run_id,
+                "_task_id": task_id,
+                "_requested_at": requested_at,
+                "_history_request": True,
+            },
+            task_id=task_id,
+            countdown=retry_after,
+        )
+    except Exception as exc:
+        log_and_capture_error(
+            exc,
+            logger,
+            "Failed to enqueue Google history retry; stale-run recovery will retry it",
+            extra={"user_id": str(user_id), "run_id": run_id},
+        )
+    return True
+
+
 @shared_task
 def sync_vendor_data(
     user_id: str,
@@ -131,12 +200,15 @@ def sync_vendor_data(
         end_date=end_date,
     )
 
+    history_delivery = None
     if _history_request:
         if not _run_id or providers != ["google"] or not is_historical:
             raise ValueError("Tracked history requires a single Google historical run")
-        if not google_history.claim(user_uuid, _run_id, _google_lock_retry):
+        history_delivery = google_history.claim_delivery(user_uuid, _run_id, _google_lock_retry)
+        if history_delivery is None:
             result.errors["google"] = "Historical delivery expired or already claimed; no work performed"
             return result.model_dump()
+        _google_lock_retry = history_delivery.attempt
 
     google_source = (
         SyncSource.LINKED_ACCOUNT
@@ -195,7 +267,7 @@ def sync_vendor_data(
                         },
                     )
                     if _history_request:
-                        google_history.finish(user_uuid, _run_id)
+                        google_history.finish(user_uuid, _run_id, _google_lock_retry)
                 return result.model_dump()
 
             log_structured(
@@ -345,7 +417,7 @@ def sync_vendor_data(
                                     metadata=run_metadata,
                                 )
                                 if _history_request:
-                                    google_history.finish(user_uuid, run_id)
+                                    google_history.finish(user_uuid, run_id, _google_lock_retry)
                             result.providers_synced[provider_name] = ProviderSyncResult(
                                 success=False, params={"deferred": deferred, "message": message, "run_id": run_id}
                             )
@@ -499,12 +571,29 @@ def sync_vendor_data(
                             # Otherwise fallback to load_all_247_data (just returns data)
                             provider_any = cast(Any, strategy.data_247)
                             if hasattr(provider_any, "load_and_save_all"):
+                                history_options: dict[str, Any] = {}
+                                if provider_name == "google" and history_delivery is not None:
+                                    def checkpoint_window(window: str, counts: dict[str, int]) -> None:
+                                        if not google_history.checkpoint_window(
+                                            user_uuid, run_id, _google_lock_retry, window, counts
+                                        ):
+                                            raise SyncLeaseLostError(
+                                                "Google historical checkpoint lease was lost"
+                                            )
+                                        if history_delivery is not None:
+                                            history_delivery.completed_windows[window] = counts
+
+                                    history_options = {
+                                        "completed_windows": history_delivery.completed_windows,
+                                        "checkpoint_window": checkpoint_window,
+                                    }
                                 results_247 = provider_any.load_and_save_all(
                                     db,
                                     user_uuid,
                                     start_time=start_dt,
                                     end_time=end_dt,
                                     is_first_sync=is_first_sync,
+                                    **history_options,
                                 )
                                 provider_result.params["data_247"] = {"success": True, "saved": True, **results_247}
                                 for _count in results_247.values():
@@ -622,7 +711,65 @@ def sync_vendor_data(
                     else:
                         final_status = SyncStatus.SUCCESS
 
-                    if final_status == SyncStatus.FAILED:
+                    history_retry_scheduled = False
+                    if (
+                        _history_request
+                        and google_incomplete
+                        and _google_lock_retry + 1 < google_history.MAX_ATTEMPTS
+                    ):
+                        retry_after = min(60 * (2 ** min(_google_lock_retry, 4)), 900)
+                        google_history.wait_for_retry(
+                            user_uuid, run_id, _google_lock_retry, retry_after
+                        )
+                        retry_metadata = {
+                            **run_metadata,
+                            "attempt": _google_lock_retry + 1,
+                            "retry_after_seconds": retry_after,
+                            "completed_windows": len(history_delivery.completed_windows)
+                            if history_delivery is not None
+                            else 0,
+                        }
+                        _emit_sync_status(
+                            queued,
+                            user_uuid,
+                            provider_name,
+                            sync_source,
+                            run_id=run_id,
+                            message="Google history sync had incomplete windows; retry scheduled",
+                            metadata=retry_metadata,
+                        )
+                        sync_vendor_data.apply_async(
+                            kwargs={
+                                "user_id": user_id,
+                                "start_date": start_date,
+                                "end_date": end_date,
+                                "providers": ["google"],
+                                "is_historical": True,
+                                "_skip_linked_fan_out": _skip_linked_fan_out,
+                                "_linked_primary_user_id": _linked_primary_user_id,
+                                "_google_lock_retry": _google_lock_retry + 1,
+                                "_run_id": run_id,
+                                "_task_id": task_id,
+                                "_requested_at": _requested_at,
+                                "_history_request": True,
+                            },
+                            task_id=task_id,
+                            countdown=retry_after,
+                        )
+                        history_retry_scheduled = True
+
+                    if history_retry_scheduled:
+                        log_structured(
+                            logger,
+                            "warning",
+                            "Google historical sync retry queued",
+                            provider=provider_name,
+                            task="sync_vendor_data",
+                            user_id=user_id,
+                            run_id=run_id,
+                            attempt=_google_lock_retry + 1,
+                        )
+                    elif final_status == SyncStatus.FAILED:
                         _emit_sync_status(
                             failed,
                             user_uuid,
@@ -667,8 +814,8 @@ def sync_vendor_data(
                             primary_user_id=primary_uuid,
                             metadata=completed_metadata,
                         )
-                    if _history_request:
-                        google_history.finish(user_uuid, run_id)
+                    if _history_request and not history_retry_scheduled:
+                        google_history.finish(user_uuid, run_id, _google_lock_retry)
 
                 except Exception as e:
                     db.rollback()
@@ -678,18 +825,35 @@ def sync_vendor_data(
                         release_primary(
                             provider_name, connection.provider_user_id, user_uuid, shared_token, scope="pull"
                         )
-                    _emit_sync_status(
-                        failed,
-                        user_uuid,
-                        provider_name,
-                        sync_source,
-                        run_id=run_id,
-                        error=str(e),
-                        message=f"Sync from {provider_name} failed",
-                        metadata=run_metadata,
-                    )
+                    retry_scheduled = False
+                    history_current = True
                     if _history_request:
-                        google_history.finish(user_uuid, run_id)
+                        retry_scheduled = _schedule_google_history_retry(
+                            user_uuid,
+                            run_id=run_id,
+                            task_id=task_id,
+                            requested_at=_requested_at,
+                            start_date=start_date,
+                            end_date=end_date,
+                            attempt=_google_lock_retry,
+                            skip_linked_fan_out=_skip_linked_fan_out,
+                            linked_primary_user_id=_linked_primary_user_id,
+                            error=str(e),
+                        )
+                        history_current = google_history.heartbeat(user_uuid, run_id, _google_lock_retry)
+                    if not retry_scheduled and history_current:
+                        _emit_sync_status(
+                            failed,
+                            user_uuid,
+                            provider_name,
+                            sync_source,
+                            run_id=run_id,
+                            error=str(e),
+                            message=f"Sync from {provider_name} failed",
+                            metadata=run_metadata,
+                        )
+                        if _history_request:
+                            google_history.finish(user_uuid, run_id, _google_lock_retry)
                     log_and_capture_error(
                         e,
                         logger,
@@ -711,24 +875,41 @@ def sync_vendor_data(
 
         except Exception as e:
             if _run_id and providers == ["google"]:
-                _emit_sync_status(
-                    failed,
-                    user_uuid,
-                    "google",
-                    google_source,
-                    run_id=_run_id,
-                    error="Google request processing failed",
-                    metadata={
-                        "is_historical": is_historical,
-                        "request_tracking": _history_request,
-                        "start_date": start_date,
-                        "end_date": end_date,
-                        "task_id": _task_id,
-                        "requested_at": _requested_at,
-                    },
-                )
-                if _history_request:
-                    google_history.finish(user_uuid, _run_id)
+                retry_scheduled = False
+                history_current = True
+                if _history_request and _task_id:
+                    retry_scheduled = _schedule_google_history_retry(
+                        user_uuid,
+                        run_id=_run_id,
+                        task_id=_task_id,
+                        requested_at=_requested_at,
+                        start_date=start_date,
+                        end_date=end_date,
+                        attempt=_google_lock_retry,
+                        skip_linked_fan_out=_skip_linked_fan_out,
+                        linked_primary_user_id=_linked_primary_user_id,
+                        error=str(e),
+                    )
+                    history_current = google_history.heartbeat(user_uuid, _run_id, _google_lock_retry)
+                if not retry_scheduled and history_current:
+                    _emit_sync_status(
+                        failed,
+                        user_uuid,
+                        "google",
+                        google_source,
+                        run_id=_run_id,
+                        error="Google request processing failed",
+                        metadata={
+                            "is_historical": is_historical,
+                            "request_tracking": _history_request,
+                            "start_date": start_date,
+                            "end_date": end_date,
+                            "task_id": _task_id,
+                            "requested_at": _requested_at,
+                        },
+                    )
+                    if _history_request:
+                        google_history.finish(user_uuid, _run_id, _google_lock_retry)
             log_and_capture_error(
                 e,
                 logger,
@@ -737,3 +918,74 @@ def sync_vendor_data(
             )
             result.errors["general"] = str(e)
             return result.model_dump()
+
+
+@shared_task
+def recover_stale_google_history() -> dict[str, int]:
+    """Resume historical Google pulls whose worker stopped renewing its lease."""
+    recovered, expired = google_history.recover_stale()
+    for request in recovered:
+        metadata = {
+            "is_historical": True,
+            "request_tracking": True,
+            "task_id": request.task_id,
+            "requested_at": request.requested_at,
+            "start_date": request.start_date,
+            "end_date": request.end_date,
+            "attempt": request.attempt,
+            "completed_windows": len(request.completed_windows),
+            "waiting_for_lock": False,
+        }
+        _emit_sync_status(
+            queued,
+            request.user_id,
+            "google",
+            SyncSource.BACKFILL,
+            run_id=request.run_id,
+            message="Worker stopped during Google history sync; resuming committed-window checkpoint",
+            metadata=metadata,
+        )
+        try:
+            sync_vendor_data.apply_async(
+                kwargs={
+                    "user_id": request.user_id,
+                    "start_date": request.start_date,
+                    "end_date": request.end_date,
+                    "providers": ["google"],
+                    "is_historical": True,
+                    "_google_lock_retry": request.attempt,
+                    "_run_id": request.run_id,
+                    "_task_id": request.task_id,
+                    "_requested_at": request.requested_at,
+                    "_history_request": True,
+                },
+                task_id=request.task_id,
+            )
+        except Exception as exc:
+            log_and_capture_error(
+                exc,
+                logger,
+                "Failed to enqueue recovered Google history run",
+                extra={"user_id": request.user_id, "run_id": request.run_id},
+            )
+    for request in expired:
+        failed(
+            request.user_id,
+            "google",
+            SyncSource.BACKFILL,
+            run_id=request.run_id,
+            error="Historical Google sync exceeded its recovery deadline or retry limit",
+            message="Historical Google sync stopped and could not be resumed",
+            metadata={
+                "is_historical": True,
+                "request_tracking": True,
+                "task_id": request.task_id,
+                "requested_at": request.requested_at,
+                "start_date": request.start_date,
+                "end_date": request.end_date,
+                "attempt": request.attempt,
+                "completed_windows": len(request.completed_windows),
+            },
+        )
+        google_history.finish(request.user_id, request.run_id, request.attempt)
+    return {"requeued": len(recovered), "failed": len(expired)}

@@ -137,20 +137,23 @@ run and task IDs, dates, and source:
 ```
 
 The actual summary also contains its normal run/provider/source/timestamp fields.
-Retry delays are 60, 120, 240, 480, and 900 seconds. Scheduling failures and
-exhaustion are terminal failures, not successful imports. A failed terminal run
+Retry delays are 60, 120, 240, 480, and 900 seconds. A failed terminal run
 allows a new explicit request immediately. Celery `SUCCESS` only means the
 function returned; it says nothing about provider delivery.
 
 Admission and the initial run record are atomic in Redis. Undelivered jobs expire
 after five minutes, waiting retries after their countdown plus five minutes,
-and running request admission after two minutes without a renewable ownership
-heartbeat. Expired deliveries cannot resurrect their request. The read-only run
-summary reports `failed` with `metadata.request_liveness_expired=true` when
-admission has expired or disappeared without a terminal event. This diagnostic
-does not fabricate a signed completion event or cancel a worker. An explicit
-retry can safely create a new run; the provider lease still fences writes.
-Redis coordination errors fail closed rather than dispatching untracked work.
+and running requests renew their two-minute lease while the worker is alive.
+Every successfully committed Google metric or sleep window is checkpointed in
+Redis. If a worker disappears, Celery Beat's stale-run reconciler requeues the
+same tracked run with its completed-window checkpoints; resumed workers skip
+those windows and fetch only unfinished ones. Replayed writes remain safe because
+the timeseries layer upserts stable sample keys. The active attempt fences both
+checkpoint updates and request completion, so an old worker cannot erase or
+complete a newer attempt. Recovery is bounded to 12 attempts and a 24-hour
+deadline; exhaustion emits a terminal failed run rather than reporting a
+successful import. Redis coordination errors fail closed rather than dispatching
+untracked work.
 
 `requested_at` is the original admission timestamp, also exposed in
 `SyncRunSummary.metadata`. It does not change on coalescing, retries, progress,
