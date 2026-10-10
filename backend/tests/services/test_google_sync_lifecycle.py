@@ -1,6 +1,7 @@
 import importlib
 import inspect
 import json
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
@@ -123,6 +124,37 @@ def test_recover_stale_legacy_request_derives_user_id_from_pending_key() -> None
     assert recovered[0].run_id == run_id
     assert recovered[0].attempt == 1
     assert recovered[0].completed_windows == {}
+
+    claimed = google_history.claim_delivery(user_id, run_id, recovered[0].attempt)
+    assert claimed is not None
+    assert claimed.user_id == str(user_id)
+    assert claimed.run_id == run_id
+
+
+def test_reserve_coalesces_legacy_request_without_serialized_user_id() -> None:
+    user_id = uuid4()
+    run_id = "pull_legacy-coalesced-google-history"
+    legacy_request = {
+        "run_id": run_id,
+        "task_id": str(uuid4()),
+        "requested_at": END.isoformat(),
+        "start_date": (END - timedelta(days=8)).isoformat(),
+        "end_date": END.isoformat(),
+        "days": 8,
+        "start": (END - timedelta(days=8)).timestamp(),
+        "end": END.timestamp(),
+        "deadline": time.time() + 3600,
+        "expires": time.time() + 300,
+        "attempt": 0,
+        "phase": "queued",
+    }
+    get_redis_client().hset(google_history.pending_key(user_id), run_id, json.dumps(legacy_request))
+
+    request, created = google_history.reserve(user_id, END - timedelta(days=8), END, 8)
+
+    assert not created
+    assert request.user_id == str(user_id)
+    assert request.run_id == run_id
 
 
 def test_wider_or_later_range_never_coalesces_with_narrower() -> None:

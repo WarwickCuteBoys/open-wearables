@@ -208,7 +208,7 @@ def reserve(user_id: UUID, start: datetime, end: datetime, days: int) -> tuple[H
         event.model_dump_json(),
         REQUEST_DEADLINE_SECONDS,
     )
-    return HistoryRequest.model_validate_json(raw), bool(created)
+    return _request_from_pending_record(raw, str(user_id)), bool(created)
 
 
 def update(
@@ -253,7 +253,7 @@ def claim_delivery(user_id: UUID | str, run_id: str, attempt: int) -> HistoryReq
     )
     if not raw:
         return None
-    request = HistoryRequest.model_validate_json(raw)
+    request = _request_from_pending_record(raw, str(user_id))
     request.completed_windows.update(
         {
             window: json.loads(counts)
@@ -293,7 +293,7 @@ def checkpoint_window(
     )
 
 
-def _recovered_request(raw: str, user_id: str) -> HistoryRequest:
+def _request_from_pending_record(raw: str, user_id: str) -> HistoryRequest:
     payload = json.loads(raw)
     if not isinstance(payload, dict):
         raise ValueError("Stored Google history request must be a JSON object")
@@ -317,7 +317,7 @@ def recover_stale() -> tuple[list[HistoryRequest], list[HistoryRequest]]:
                 _RECOVER_STALE, 1, key, MAX_ATTEMPTS, QUEUED_SECONDS, REQUEST_DEADLINE_SECONDS
             )
             for raw in json.loads(result[0]):
-                request = _recovered_request(raw, user_id)
+                request = _request_from_pending_record(raw, user_id)
                 request.completed_windows.update(
                     {
                         window: json.loads(counts)
@@ -326,7 +326,7 @@ def recover_stale() -> tuple[list[HistoryRequest], list[HistoryRequest]]:
                 )
                 recovered.append(request)
             for raw in json.loads(result[1]):
-                request = _recovered_request(raw, user_id)
+                request = _request_from_pending_record(raw, user_id)
                 request.completed_windows.update(
                     {
                         window: json.loads(counts)
