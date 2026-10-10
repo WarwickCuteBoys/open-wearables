@@ -293,6 +293,14 @@ def checkpoint_window(
     )
 
 
+def _recovered_request(raw: str, user_id: str) -> HistoryRequest:
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("Stored Google history request must be a JSON object")
+    payload["user_id"] = user_id
+    return HistoryRequest.model_validate(payload)
+
+
 def recover_stale() -> tuple[list[HistoryRequest], list[HistoryRequest]]:
     """Requeue abandoned Google history runs while retaining committed windows."""
     client = get_redis_client()
@@ -304,11 +312,12 @@ def recover_stale() -> tuple[list[HistoryRequest], list[HistoryRequest]]:
         for key in keys:
             if ":windows:" in key:
                 continue
+            user_id = key.removeprefix("sync:google:history:")
             result = client.eval(
                 _RECOVER_STALE, 1, key, MAX_ATTEMPTS, QUEUED_SECONDS, REQUEST_DEADLINE_SECONDS
             )
             for raw in json.loads(result[0]):
-                request = HistoryRequest.model_validate_json(raw)
+                request = _recovered_request(raw, user_id)
                 request.completed_windows.update(
                     {
                         window: json.loads(counts)
@@ -317,7 +326,7 @@ def recover_stale() -> tuple[list[HistoryRequest], list[HistoryRequest]]:
                 )
                 recovered.append(request)
             for raw in json.loads(result[1]):
-                request = HistoryRequest.model_validate_json(raw)
+                request = _recovered_request(raw, user_id)
                 request.completed_windows.update(
                     {
                         window: json.loads(counts)
