@@ -15,6 +15,51 @@ from app.services.providers.google.health_api import data_247 as google
 from app.services.timeseries_service import _PENDING_WEBHOOKS, TimeSeriesService, svix_service, threading
 
 
+def test_low_volume_metrics_batch_without_truncating_history() -> None:
+    metric = next(m for m in google.METRICS if m.data_type == "daily-resting-heart-rate")
+    end = datetime(2026, 1, 9, tzinfo=timezone.utc)
+    begin = end - timedelta(days=8)
+    windows = list(google.GoogleHealth247Data._metric_windows(metric, begin, end))
+    assert windows == [(end - timedelta(days=7), end), (begin, end - timedelta(days=7))]
+    legacy = {f"metric:{metric.data_type}:{(end - timedelta(days=1)).isoformat()}:{end.isoformat()}": {}}
+    assert len(list(google.GoogleHealth247Data._metric_windows(metric, begin, end, legacy))) == 8
+    checkpoint = {f"metric:{metric.data_type}:{windows[0][0].isoformat()}:{end.isoformat()}": {}}
+    assert list(google.GoogleHealth247Data._metric_windows(metric, begin, end, checkpoint)) == windows
+    heart = next(m for m in google.METRICS if m.data_type == "heart-rate")
+    assert len(list(google.GoogleHealth247Data._metric_windows(heart, begin, end))) == 8
+
+
+def test_batched_metric_fetches_twice_and_persists_all_eight_days(monkeypatch: pytest.MonkeyPatch) -> None:
+    handler = google.GoogleHealth247Data(MagicMock(), MagicMock(), "https://google.invalid")
+    handler.settings_repo.get_data_granularity = MagicMock(return_value=DataGranularity.RAW)
+    handler.sleep.load_and_save = MagicMock(return_value=0)
+    metric = next(m for m in google.METRICS if m.data_type == "daily-resting-heart-rate")
+    monkeypatch.setattr(google, "METRICS", [metric])
+    end = datetime(2026, 1, 9, tzinfo=timezone.utc)
+    begin = end - timedelta(days=8)
+    timestamps = [begin + timedelta(days=day, hours=12) for day in range(8)]
+    fetch = MagicMock(side_effect=lambda _db, _user, _metric, low, high: [t for t in timestamps if low <= t < high])
+    handler._native_samples = fetch
+    persisted = []
+
+    def save(_db: MagicMock, samples: list[datetime]) -> WriteCounts:
+        persisted.extend(samples)
+        return WriteCounts(len(samples), 0)
+
+    monkeypatch.setattr(google.timeseries_service, "bulk_create_samples", save)
+    checkpoint = MagicMock()
+    completed = {}
+    result = handler.load_and_save_all(
+        MagicMock(), uuid4(), begin, end, completed_windows=completed, checkpoint_window=checkpoint
+    )
+    assert fetch.call_count == 2
+    assert sorted(persisted) == timestamps
+    assert result[metric.data_type].inserted == 8
+    fetch.reset_mock()
+    handler.load_and_save_all(MagicMock(), uuid4(), begin, end, completed_windows=completed)
+    fetch.assert_not_called()
+
+
 def test_energy_commits_before_sleep_and_raw_history(monkeypatch: pytest.MonkeyPatch) -> None:
     handler = google.GoogleHealth247Data(MagicMock(), MagicMock(), "https://google.invalid")
     handler.settings_repo.get_data_granularity = MagicMock(return_value=DataGranularity.RAW)

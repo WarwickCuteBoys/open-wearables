@@ -227,6 +227,18 @@ class DataPointSeriesRepository(
             for i in range(0, len(values_list), self.BATCH_INSERT_CHUNK_SIZE):
                 chunk = values_list[i : i + self.BATCH_INSERT_CHUNK_SIZE]
                 stmt = insert(self.model).values(chunk)
+                changed_columns = (
+                    "value",
+                    "external_id",
+                    "zone_offset",
+                    "is_daily_total",
+                    "interval_end",
+                    "end_zone_offset",
+                    "source_type",
+                    "ingestion_version",
+                    "coverage_known",
+                    "ingested_at",
+                )
                 stmt = stmt.on_conflict_do_update(
                     index_elements=["data_source_id", "series_type_definition_id", "recorded_at"],
                     set_={
@@ -241,6 +253,12 @@ class DataPointSeriesRepository(
                         "coverage_known": stmt.excluded.coverage_known,
                         "ingested_at": stmt.excluded.ingested_at,
                     },
+                    where=or_(
+                        *(
+                            getattr(self.model, column).is_distinct_from(getattr(stmt.excluded, column))
+                            for column in changed_columns
+                        )
+                    ),
                     # RETURNING (xmax = 0): true = row freshly inserted, false = hit a
                     # conflict and was updated in place. Same statement, no extra round-trip.
                 ).returning(literal_column("(xmax = 0)"))

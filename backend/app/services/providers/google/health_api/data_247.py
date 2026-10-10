@@ -26,7 +26,7 @@ from app.schemas.enums import GRANULARITY_WINDOW_SECONDS, DataGranularity, Serie
 from app.schemas.model_crud.activities import TimeSeriesSampleCreate
 from app.schemas.providers.google import DataTypeMetric, ListSpec, RollupSpec, TimeShape
 from app.services.energy_summary import GOOGLE_CALENDAR_TOTAL_PREFIX, day_bounds
-from app.services.providers.api_client import make_authenticated_request
+from app.services.providers.api_client import make_authenticated_request, pooled_provider_requests
 from app.services.providers.google.health_api.helpers import (
     GOOGLE_HEALTH_API_SOURCE,
     extract_source,
@@ -48,6 +48,20 @@ from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 ENERGY_TYPES = frozenset({SeriesType.active_energy, SeriesType.total_energy})
+LOW_VOLUME_METRICS = frozenset(
+    {
+        "daily-resting-heart-rate",
+        "heart-rate-variability",
+        "run-vo2-max",
+        "daily-respiratory-rate",
+        "oxygen-saturation",
+        "blood-glucose",
+        "core-body-temperature",
+        "weight",
+        "body-fat",
+        "hydration-log",
+    }
+)
 
 
 class GoogleHealth247Data(Base247DataTemplate):
@@ -66,6 +80,7 @@ class GoogleHealth247Data(Base247DataTemplate):
 
     # -- orchestration ---------------------------------------------------------
 
+    @pooled_provider_requests
     def load_and_save_all(
         self,
         db: DbSession,
@@ -106,7 +121,7 @@ class GoogleHealth247Data(Base247DataTemplate):
 
         def sync_metric(metric: DataTypeMetric) -> None:
             nonlocal succeeded
-            for low, high in self._recent_windows(start_time, end_time):
+            for low, high in self._metric_windows(metric, start_time, end_time, completed):
                 window = f"metric:{metric.data_type}:{low.isoformat()}:{high.isoformat()}"
                 if window in completed:
                     counts = WriteCounts(
@@ -214,6 +229,7 @@ class GoogleHealth247Data(Base247DataTemplate):
         )
         return results
 
+    @pooled_provider_requests
     def sync_data_type(
         self,
         db: DbSession,
@@ -235,7 +251,7 @@ class GoogleHealth247Data(Base247DataTemplate):
             self.settings_repo.get_data_granularity(db, self.provider_name) or settings.default_data_granularity
         )
         result: WriteCounts | None = None
-        for low, high in self._recent_windows(start_time, end_time):
+        for low, high in self._metric_windows(metric, start_time, end_time):
             try:
                 counts = self._save_metric(db, user_id, metric, low, high, granularity)
             except Exception:
@@ -247,11 +263,33 @@ class GoogleHealth247Data(Base247DataTemplate):
         return result
 
     @staticmethod
-    def _recent_windows(start: datetime, end: datetime) -> Iterator[tuple[datetime, datetime]]:
+    def _metric_windows(
+        metric: DataTypeMetric,
+        start: datetime,
+        end: datetime,
+        completed: dict[str, dict[str, int]] | None = None,
+    ) -> Iterator[tuple[datetime, datetime]]:
+        # Keep legacy daily checkpoints usable on retries of an existing request.
         if start > end:
             raise ValueError("start_time must be before or equal to end_time")
+        daily_windows = list(GoogleHealth247Data._recent_windows(start, end))
+        batch_windows = list(GoogleHealth247Data._recent_windows(start, end, days=7))
+        legacy_checkpoint = any(
+            f"metric:{metric.data_type}:{low.isoformat()}:{high.isoformat()}" in (completed or {})
+            for low, high in daily_windows
+            if (low, high) not in batch_windows
+        )
+        windows = batch_windows if metric.data_type in LOW_VOLUME_METRICS and not legacy_checkpoint else daily_windows
+        yield from windows
+
+    @staticmethod
+    def _recent_windows(start: datetime, end: datetime, days: int = 1) -> Iterator[tuple[datetime, datetime]]:
+        if start > end:
+            raise ValueError("start_time must be before or equal to end_time")
+        if days < 1:
+            raise ValueError("Window size must be at least one day")
         while end > start:
-            low = max(start, end - timedelta(days=1))
+            low = max(start, end - timedelta(days=days))
             yield low, end
             end = low
 

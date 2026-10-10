@@ -84,6 +84,30 @@ query plan to attribute actual disk reads. No sample values or tokens are logged
 The 24/7 sync fetches total and active energy first, newest windows first, and
 commits each metric window independently. Other time-series requests are also
 bounded to one day, rather than buffering an entire multi-day raw backfill.
+Low-volume heart, body and vital metrics use newest-first windows of up to seven
+days, reducing repeated authenticated requests without dropping samples. Heart
+rate, steps, distance and energy retain daily commits. Retries recognize
+daily checkpoints from an older worker and keep its daily window scheme.
+Provider pagination and rollup range limits still apply inside each window.
+
+Google 24/7 pulls and single-metric webhook fetches reuse one HTTP client for
+their lifetime, including sleep requests. Each request still validates OAuth
+credentials and retains rate-limit retries; the client closes on success or
+failure and is never shared across worker processes.
+
+Bulk upserts skip an existing row only when its value and all mutable metadata
+are identical (using NULL-safe comparisons). Actual corrections still update
+the row. Energy ingestion timestamps remain part of the comparison because
+they are used by coverage calculations. `inserted` and `updated` counts report
+actual writes, not unchanged replays. Data-ready notification behavior is
+unchanged, so a consuming app can still catch up on an already-stored batch.
+
+These optimizations retain raw heart-rate resolution. Replacing raw samples
+with minute averages would also change workout averages, daily extrema and
+intensity-minute calculations; it requires an explicit aggregate-data contract,
+not inserting averaged samples alongside existing raw history. Validate live
+fetch/write timings after rollout; fewer requests and writes do not imply a
+guaranteed latency improvement.
 Successful windows survive a later failure and emit data-ready webhooks as soon
 as the outer transaction commits. Notifications retain neither committed sample
 arrays for the session lifetime nor data from rolled-back savepoints.

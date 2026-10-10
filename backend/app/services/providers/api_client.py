@@ -2,7 +2,11 @@
 
 import logging
 import time
+from collections.abc import Callable
+from contextlib import nullcontext
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from typing import Any
 from uuid import UUID
 
@@ -16,6 +20,25 @@ from app.services.providers.templates.base_oauth import BaseOAuthTemplate
 from app.utils.structured_logging import log_structured
 
 logger = logging.getLogger(__name__)
+_request_client: ContextVar[httpx.Client | None] = ContextVar("provider_request_client", default=None)
+
+
+def pooled_provider_requests[**P, R](function: Callable[P, R]) -> Callable[P, R]:
+    """Reuse connections within one sync, never across worker processes or tasks."""
+
+    @wraps(function)
+    def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
+        if _request_client.get() is not None:
+            return function(*args, **kwargs)
+        with httpx.Client() as client:
+            token = _request_client.set(client)
+            try:
+                return function(*args, **kwargs)
+            finally:
+                _request_client.reset(token)
+
+    return wrapped
+
 
 # Rate limiting configuration (Garmin: 100 req / 60s window)
 MAX_RETRIES = 3
@@ -153,7 +176,8 @@ def make_authenticated_request(
 
     for attempt in range(MAX_RETRIES + 1):
         try:
-            with httpx.Client(http2=http2) as client:
+            pooled = _request_client.get() if not http2 else None
+            with nullcontext(pooled) if pooled is not None else httpx.Client(http2=http2) as client:
                 response = client.request(
                     method=method,
                     url=url,
