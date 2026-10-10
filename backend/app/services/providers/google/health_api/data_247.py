@@ -265,16 +265,45 @@ class GoogleHealth247Data(Base247DataTemplate):
         granularity: DataGranularity,
     ) -> WriteCounts | None:
         check_google_pull_lease(db)
+        began = monotonic()
         if metric.series_type in ENERGY_TYPES:
             samples = self._energy_samples(db, user_id, metric, start, end)
         elif metric.use_list(granularity):
             samples = self._native_samples(db, user_id, metric, start, end)
         else:
             samples = self._rollup_samples(db, user_id, metric, start, end, granularity)
+        fetched_at = monotonic()
         if not samples:
+            log_structured(
+                self.logger,
+                "info",
+                "Google metric import stages",
+                provider="google",
+                event="google_import_stages",
+                data_type=metric.data_type,
+                fetch_parse_ms=round((fetched_at - began) * 1000, 3),
+                write_ms=0,
+                commit_ms=0,
+                sample_count=0,
+            )
             return None
         counts = timeseries_service.bulk_create_samples(db, samples)
+        written_at = monotonic()
         db.commit()
+        log_structured(
+            self.logger,
+            "info",
+            "Google metric import stages",
+            provider="google",
+            event="google_import_stages",
+            data_type=metric.data_type,
+            fetch_parse_ms=round((fetched_at - began) * 1000, 3),
+            write_ms=round((written_at - fetched_at) * 1000, 3),
+            commit_ms=round((monotonic() - written_at) * 1000, 3),
+            sample_count=len(samples),
+            inserted=counts.inserted,
+            updated=counts.updated,
+        )
         return counts
 
     def _energy_samples(
@@ -611,6 +640,8 @@ class GoogleHealth247Data(Base247DataTemplate):
         points: list[dict[str, Any]] = []
         page_token: str | None = None
         seen_tokens: set[str] = set()
+        began = monotonic()
+        page_count = 0
         while True:
             check_google_pull_lease(db)
             params: dict[str, Any] = {"pageSize": self.LIST_PAGE_SIZE}
@@ -629,6 +660,7 @@ class GoogleHealth247Data(Base247DataTemplate):
                 method="GET",
                 params=params,
             )
+            page_count += 1
             store_raw_payload(
                 source="api_response",
                 provider=self.provider_name,
@@ -645,6 +677,17 @@ class GoogleHealth247Data(Base247DataTemplate):
             if not isinstance(page_token, str) or page_token in seen_tokens:
                 raise ValueError("Invalid or repeated Google pagination token")
             seen_tokens.add(page_token)
+        log_structured(
+            self.logger,
+            "info",
+            "Google native pagination",
+            provider="google",
+            event="google_native_fetch",
+            endpoint=endpoint,
+            elapsed_ms=round((monotonic() - began) * 1000, 3),
+            pages=page_count,
+            point_count=len(points),
+        )
         return points
 
     def _sample(

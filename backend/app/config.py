@@ -166,6 +166,8 @@ class Settings(BaseSettings):
     sensorbio_default_scope: str = ""
 
     # FITBIT OAUTH SETTINGS
+    summary_cache_warm_timezone: str | None = None
+
     fitbit_client_id: str | None = None
     fitbit_client_secret: SecretStr | None = None
     fitbit_redirect_uri: str | None = None  # Deprecated: use API_BASE_URL

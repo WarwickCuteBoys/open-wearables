@@ -26,6 +26,7 @@ from app.schemas.auth import ConnectionStatus, LiveSyncMode, TokenType
 from app.schemas.enums import AggregationMethod, DataGranularity, HealthScoreCategory, ProviderName
 from app.schemas.model_crud.user_management import InvitationStatus
 from app.utils.mappings_meta import AutoRelMeta
+from app.utils.summary_metrics import install_summary_metrics
 
 engine = create_engine(
     settings.db_uri,
@@ -36,6 +37,7 @@ engine = create_engine(
     pool_recycle=3600,
 )
 async_engine = create_async_engine(settings.db_uri)
+install_summary_metrics(engine)
 
 
 def _prepare_sessionmaker(engine: Engine) -> sessionmaker:

@@ -8,7 +8,7 @@ from app.config import settings
 
 
 @lru_cache()
-def get_redis_client() -> redis.Redis:
+def get_redis_client(socket_timeout: float | None = None) -> redis.Redis:
     """
     Get a singleton Redis client instance.
 
@@ -21,4 +21,6 @@ def get_redis_client() -> redis.Redis:
     return redis.from_url(
         settings.redis_url,
         decode_responses=True,
+        socket_timeout=socket_timeout,
+        socket_connect_timeout=socket_timeout,
     )

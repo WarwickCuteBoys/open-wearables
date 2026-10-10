@@ -42,7 +42,44 @@ The Google Health API is an **aggregation layer**: it surfaces data from *every*
 | **Polling (pull)** | Open Wearables periodically fetches data via the Health API (Celery Beat), driven by the [fetch mode](#data-granularity-and-fetch-modes) below. |
 | **Webhooks (notify-only)** | Google sends a lightweight ping naming the changed `dataType` and time intervals; Open Wearables then fetches the changed data over REST. Requires a project-level [subscriber registration](#webhook-subscriber-registration). |
 
-### Progressive historical sync
+### Summary read performance
+
+Activity, step-minute and heart-rate intensity aggregates are cached per user,
+civil day, timezone and threshold options for 24 hours. PostgreSQL statement
+triggers change a per-day generation in the same transaction as sample inserts,
+corrections and deletes. Source changes invalidate that user's source identity.
+Redis therefore cannot serve a previously committed generation after a correction
+has committed, and rollback does not publish a changed generation. Cached raw
+aggregates do not replace the live priority, profile, workout or energy-coverage
+calculations. Cache failures are logged and use the database, not empty results.
+
+Queries have indexed lower and upper timestamp bounds. A concurrently built
+covering index includes value, offset and daily-total fields. Index-only scans
+still depend on PostgreSQL visibility; the index alone is not a latency guarantee.
+Deploy migrations through `d984315aa362` before running the new API and workers.
+The revision migration commits separately from the concurrent index migration;
+a cancelled index build is removed and rebuilt on retry.
+
+The sync worker primes the most recent 14 days after provider ingestion. Set
+`SUMMARY_CACHE_WARM_TIMEZONE=Asia/Bangkok` to prime that civil timezone as well as
+the existing per-record-offset behavior. Other timezones and older dates populate
+on first read. This only bounds cache warming: it does not truncate the requested
+historical import or discard raw samples. Cold reads, cache outages and active
+corrections still require aggregation, so validate the full endpoint under the
+actual production workload before claiming a 1–2-second SLA.
+
+Structured events expose `summary_read` (latency, requested/hit/miss days and
+returned aggregate counts), `summary_query` (SQL execution latency),
+`google_native_fetch` (page count, points and fetch duration), and
+`google_import_stages` (fetch-and-parse, writes, commit and sample count).
+Returned aggregate rows are **not** the raw rows or bytes scanned.
+`summary_volume.matched_samples` counts raw samples admitted by the aggregation
+filters, not rows visited and discarded by the physical query plan. Fetch duration
+includes authenticated-request retries, lease checks and raw-payload storage;
+commit duration includes after-commit listeners. Use RDS counters and a bounded
+query plan to attribute actual disk reads. No sample values or tokens are logged.
+
+### Progressive historical ingestion
 
 The 24/7 sync fetches total and active energy first, newest windows first, and
 commits each metric window independently. Other time-series requests are also

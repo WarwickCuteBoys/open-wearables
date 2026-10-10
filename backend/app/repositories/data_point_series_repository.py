@@ -1,8 +1,10 @@
 import contextlib
 from datetime import datetime, time, timedelta
+from logging import getLogger
 from uuid import UUID
 
 from psycopg.errors import UniqueViolation
+from pydantic import TypeAdapter
 from sqlalchemy import (
     ColumnElement,
     Date,
@@ -26,6 +28,7 @@ from app.models import DataPointSeries, DataPointSeriesArchive, DataSource, Devi
 from app.models.series_type_definition import SeriesTypeDefinition
 from app.repositories.data_source_repository import DataSourceRepository
 from app.repositories.repositories import CrudRepository
+from app.repositories.summary_cache import daily_aggregates, timestamp_bounds
 from app.schemas.enums import (
     ProviderName,
     SeriesType,
@@ -44,6 +47,9 @@ from app.schemas.responses.activity import (
 )
 from app.utils.exceptions import handle_exceptions
 from app.utils.pagination import decode_cursor
+from app.utils.structured_logging import log_structured
+
+logger = getLogger(__name__)
 
 # Identity tuple: (user_id, device_model, source)
 DataSourceIdentity = tuple[UUID, str | None, str | None]
@@ -531,6 +537,26 @@ class DataPointSeriesRepository(
         end_date: datetime,
         timezone_name: str | None = None,
     ) -> list[ActivityAggregateResult]:
+        return daily_aggregates(
+            db_session,
+            user_id,
+            start_date,
+            end_date,
+            kind="activity",
+            timezone_name=timezone_name,
+            adapter=TypeAdapter(list[ActivityAggregateResult]),
+            row_date=lambda row: row["activity_date"],
+            fetch=lambda low, high: self._daily_activity_aggregates(db_session, user_id, low, high, timezone_name),
+        )
+
+    def _daily_activity_aggregates(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_date: datetime,
+        end_date: datetime,
+        timezone_name: str | None = None,
+    ) -> list[ActivityAggregateResult]:
         """Get daily activity aggregates from time-series data.
 
         Aggregates steps, energy, heart rate stats by date for a user.
@@ -556,6 +582,7 @@ class DataPointSeriesRepository(
         )
         if timezone_name:
             local_date = cast(func.timezone(timezone_name, self.model.recorded_at), Date)
+        low, high = timestamp_bounds(start_date, end_date, timezone_name)
 
         def prefer_daily_sum(series_id: int) -> ColumnElement:
             """Per (day, source): use the daily-total rows if any exist, else sum samples.
@@ -593,6 +620,7 @@ class DataPointSeriesRepository(
                 # (uq_data_source_identity is unique per user on provider/device_model/source),
                 # so adding it to the GROUP BY cannot change the number of groups.
                 DataSource.device_type.label("device_type"),
+                func.count().label("matched_samples"),
                 # Steps - prefer daily total, else sum samples
                 prefer_daily_sum(steps_id).label("steps_sum"),
                 # Active energy - prefer daily total, else sum samples
@@ -623,7 +651,8 @@ class DataPointSeriesRepository(
                     DataSource.provider == "google",
                     self.model.series_type_definition_id.in_([energy_id, basal_energy_id]),
                 ),
-                self.model.recorded_at >= start_date - timedelta(days=1),
+                self.model.recorded_at >= low,
+                self.model.recorded_at < high,
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
                 self.model.series_type_definition_id.in_(
@@ -638,11 +667,20 @@ class DataPointSeriesRepository(
                 DataSource.device_type,
             )
             .order_by(asc(local_date))
+            .execution_options(summary_query="daily_activity")
             .all()
         )
 
         # Transform to list of dicts
         aggregates: list[ActivityAggregateResult] = []
+        log_structured(
+            logger,
+            "info",
+            "Raw samples aggregated",
+            event="summary_volume",
+            query_name="daily_activity",
+            matched_samples=sum(row.matched_samples for row in results),
+        )
         for row in results:
             aggregates.append(
                 {
@@ -697,6 +735,30 @@ class DataPointSeriesRepository(
         active_threshold: int = 30,
         timezone_name: str | None = None,
     ) -> list[ActiveMinutesResult]:
+        return daily_aggregates(
+            db_session,
+            user_id,
+            start_date,
+            end_date,
+            kind="active_minutes",
+            timezone_name=timezone_name,
+            options=(active_threshold,),
+            adapter=TypeAdapter(list[ActiveMinutesResult]),
+            row_date=lambda row: row["activity_date"],
+            fetch=lambda low, high: self._daily_active_minutes(
+                db_session, user_id, low, high, active_threshold, timezone_name
+            ),
+        )
+
+    def _daily_active_minutes(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_date: datetime,
+        end_date: datetime,
+        active_threshold: int = 30,
+        timezone_name: str | None = None,
+    ) -> list[ActiveMinutesResult]:
         """Get daily active/sedentary minutes from step data.
 
         Buckets step data by minute and counts:
@@ -712,6 +774,7 @@ class DataPointSeriesRepository(
         - active_minutes, tracked_minutes, sedentary_minutes
         """
         steps_id = get_series_type_id(SeriesType.steps)
+        low, high = timestamp_bounds(start_date, end_date, timezone_name)
 
         local_date = cast(
             self.model.recorded_at + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
@@ -731,11 +794,13 @@ class DataPointSeriesRepository(
                 DataSource.device_model,
                 minute_trunc.label("minute_bucket"),
                 func.sum(self.model.value).label("steps_in_minute"),
+                func.count().label("matched_samples"),
             )
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
-                self.model.recorded_at >= start_date - timedelta(days=1),
+                self.model.recorded_at >= low,
+                self.model.recorded_at < high,
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
                 self.model.series_type_definition_id == steps_id,
@@ -762,6 +827,7 @@ class DataPointSeriesRepository(
                 ),
                 # Count all tracked minutes
                 func.count(minute_bucket.c.minute_bucket).label("tracked_minutes"),
+                func.sum(minute_bucket.c.matched_samples).label("matched_samples"),
             )
             .group_by(
                 minute_bucket.c.activity_date,
@@ -769,10 +835,19 @@ class DataPointSeriesRepository(
                 minute_bucket.c.device_model,
             )
             .order_by(asc(minute_bucket.c.activity_date))
+            .execution_options(summary_query="active_minutes")
             .all()
         )
 
         aggregates: list[ActiveMinutesResult] = []
+        log_structured(
+            logger,
+            "info",
+            "Raw samples aggregated",
+            event="summary_volume",
+            query_name="active_minutes",
+            matched_samples=int(sum(row.matched_samples for row in results)),
+        )
         for row in results:
             active = int(row.active_minutes) if row.active_minutes else 0
             tracked = int(row.tracked_minutes) if row.tracked_minutes else 0
@@ -802,6 +877,33 @@ class DataPointSeriesRepository(
         vigorous_max: int,
         timezone_name: str | None = None,
     ) -> list[IntensityMinutesResult]:
+        return daily_aggregates(
+            db_session,
+            user_id,
+            start_date,
+            end_date,
+            kind="intensity_minutes",
+            timezone_name=timezone_name,
+            options=(light_min, light_max, moderate_max, vigorous_max),
+            adapter=TypeAdapter(list[IntensityMinutesResult]),
+            row_date=lambda row: row["activity_date"],
+            fetch=lambda low, high: self._daily_intensity_minutes(
+                db_session, user_id, low, high, light_min, light_max, moderate_max, vigorous_max, timezone_name
+            ),
+        )
+
+    def _daily_intensity_minutes(
+        self,
+        db_session: DbSession,
+        user_id: UUID,
+        start_date: datetime,
+        end_date: datetime,
+        light_min: int,
+        light_max: int,
+        moderate_max: int,
+        vigorous_max: int,
+        timezone_name: str | None = None,
+    ) -> list[IntensityMinutesResult]:
         """Get daily intensity minutes from heart rate data.
 
         Buckets HR data by minute and categorizes by intensity zone based on
@@ -818,6 +920,7 @@ class DataPointSeriesRepository(
         - light_minutes, moderate_minutes, vigorous_minutes
         """
         hr_id = get_series_type_id(SeriesType.heart_rate)
+        low, high = timestamp_bounds(start_date, end_date, timezone_name)
 
         local_date = cast(
             self.model.recorded_at + cast(func.coalesce(self.model.zone_offset, "+00:00"), Interval),
@@ -837,11 +940,13 @@ class DataPointSeriesRepository(
                 DataSource.device_model,
                 minute_trunc.label("minute_bucket"),
                 func.avg(self.model.value).label("avg_hr_in_minute"),
+                func.count().label("matched_samples"),
             )
             .join(DataSource, self.model.data_source_id == DataSource.id)
             .filter(
                 DataSource.user_id == user_id,
-                self.model.recorded_at >= start_date - timedelta(days=1),
+                self.model.recorded_at >= low,
+                self.model.recorded_at < high,
                 local_date >= cast(start_date, Date),
                 local_date < cast(end_date, Date),
                 self.model.series_type_definition_id == hr_id,
@@ -862,6 +967,7 @@ class DataPointSeriesRepository(
                 minute_bucket.c.source,
                 minute_bucket.c.device_model,
                 # Light: 50-63% of max HR
+                func.sum(minute_bucket.c.matched_samples).label("matched_samples"),
                 func.sum(
                     case(
                         (
@@ -901,10 +1007,19 @@ class DataPointSeriesRepository(
                 minute_bucket.c.device_model,
             )
             .order_by(asc(minute_bucket.c.activity_date))
+            .execution_options(summary_query="intensity_minutes")
             .all()
         )
 
         aggregates: list[IntensityMinutesResult] = []
+        log_structured(
+            logger,
+            "info",
+            "Raw samples aggregated",
+            event="summary_volume",
+            query_name="intensity_minutes",
+            matched_samples=int(sum(row.matched_samples for row in results)),
+        )
         for row in results:
             aggregates.append(
                 {

@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import UniqueConstraint
+from sqlalchemy import Index, UniqueConstraint
 from sqlalchemy.orm import Mapped
 
 from app.database import BaseDbModel
@@ -20,6 +20,13 @@ class DataPointSeries(BaseDbModel):
 
     __tablename__ = "data_point_series"
     __table_args__ = (
+        Index(
+            "ix_timeseries_summary_cover",
+            "data_source_id",
+            "series_type_definition_id",
+            "recorded_at",
+            postgresql_include=["value", "zone_offset", "is_daily_total"],
+        ),
         UniqueConstraint(
             "data_source_id",
             "series_type_definition_id",
