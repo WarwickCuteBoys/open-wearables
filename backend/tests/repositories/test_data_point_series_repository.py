@@ -677,6 +677,46 @@ class TestDataPointSeriesRepository:
         assert (second.inserted, second.updated) == (0, 1)
         assert int(second) == 1
 
+    @pytest.mark.parametrize(
+        "correction",
+        [
+            {"value": Decimal("73")},
+            {"zone_offset": "+07:00"},
+            {"external_id": "corrected"},
+            {"interval_end": datetime(2099, 1, 1, 0, 1, tzinfo=timezone.utc)},
+            {"end_zone_offset": "+07:00"},
+            {"source_type": "heart-rate"},
+            {"ingestion_version": 2},
+            {"coverage_known": False},
+            {"is_daily_total": True},
+            {"ingested_at": datetime(2099, 1, 2, tzinfo=timezone.utc)},
+        ],
+    )
+    def test_bulk_create_skips_identical_rows_but_preserves_corrections(
+        self, db: Session, series_repo: DataPointSeriesRepository, correction: dict
+    ) -> None:
+        user = UserFactory()
+        sample = TimeSeriesSampleCreate(
+            id=uuid4(),
+            user_id=user.id,
+            source="google_health_api",
+            provider="google",
+            recorded_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+            value=72,
+            series_type=SeriesType.heart_rate,
+        )
+        assert series_repo.bulk_create(db, [sample]).inserted == 1
+        replay = sample.model_copy(update={"id": uuid4()})
+        assert int(series_repo.bulk_create(db, [replay])) == 0
+        revised = replay.model_copy(update=correction)
+        counts = series_repo.bulk_create(db, [revised])
+        assert (counts.inserted, counts.updated) == (0, 1)
+        db.expire_all()
+        row = series_repo.get(db, sample.id)
+        assert row is not None
+        for column, value in correction.items():
+            assert getattr(row, column) == value
+
     def test_bulk_create_empty_returns_zero_counts(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
         """An empty batch writes nothing and reports zero inserted/updated."""
         counts = series_repo.bulk_create(db, [])
