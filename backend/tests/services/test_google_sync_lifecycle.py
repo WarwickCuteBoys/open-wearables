@@ -65,6 +65,38 @@ def test_simultaneous_equivalent_and_narrower_requests_coalesce() -> None:
     assert len(sync_status_service.get_run_summaries(user)) == 1
 
 
+def test_stale_history_delivery_resumes_checkpoints_and_fences_old_attempt() -> None:
+    user = uuid4()
+    request, _ = google_history.reserve(user, END - timedelta(days=8), END, 8)
+    delivery = google_history.claim_delivery(user, request.run_id, 0)
+    assert delivery is not None
+
+    window = "metric:heart-rate:2026-09-10T08:00:00+00:00:2026-09-11T08:00:00+00:00"
+    assert google_history.checkpoint_window(
+        user, request.run_id, 0, window, {"inserted": 3, "updated": 1}
+    )
+    expire_request(user, request.run_id)
+
+    recovered, expired = google_history.recover_stale()
+    assert expired == []
+    assert len(recovered) == 1
+    assert recovered[0].attempt == 1
+    assert recovered[0].completed_windows[window] == {"inserted": 3, "updated": 1}
+    assert not google_history.checkpoint_window(
+        user, request.run_id, 0, "stale-window", {"inserted": 1, "updated": 0}
+    )
+
+    resumed = google_history.claim_delivery(user, request.run_id, 1)
+    assert resumed is not None
+    assert resumed.completed_windows[window] == {"inserted": 3, "updated": 1}
+    assert google_history.checkpoint_window(
+        user, request.run_id, 1, "new-window", {"inserted": 1, "updated": 0}
+    )
+    assert not google_history.finish(user, request.run_id, 0)
+    assert google_history.remaining(user, request.run_id) > 0
+    assert google_history.finish(user, request.run_id, 1)
+
+
 def test_wider_or_later_range_never_coalesces_with_narrower() -> None:
     user = uuid4()
     first, _ = google_history.reserve(user, END - timedelta(days=7), END, 7)

@@ -8,7 +8,7 @@ native-resolution operation chosen by ``google_use_reconcile`` — ``dataPoints:
 come from the sessions endpoint and are handled separately.
 """
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from time import monotonic
@@ -73,6 +73,8 @@ class GoogleHealth247Data(Base247DataTemplate):
         start_time: datetime,
         end_time: datetime,
         is_first_sync: bool = False,
+        completed_windows: dict[str, dict[str, int]] | None = None,
+        checkpoint_window: Callable[[str, dict[str, int]], None] | None = None,
     ) -> dict[str, WriteCounts]:
         """Commit energy promptly, then recent sleep and bounded raw history."""
         if start_time > end_time:
@@ -92,13 +94,32 @@ class GoogleHealth247Data(Base247DataTemplate):
             self.settings_repo.get_data_granularity(db, self.provider_name) or settings.default_data_granularity
         )
         results: dict[str, WriteCounts] = {}
+        completed = completed_windows if completed_windows is not None else {}
         failures: dict[str, str] = {}
         succeeded = 0
         sleep_count = 0
 
+        def record_checkpoint(window: str, counts: dict[str, int]) -> None:
+            if checkpoint_window is not None:
+                checkpoint_window(window, counts)
+            completed[window] = counts
+
         def sync_metric(metric: DataTypeMetric) -> None:
             nonlocal succeeded
             for low, high in self._recent_windows(start_time, end_time):
+                window = f"metric:{metric.data_type}:{low.isoformat()}:{high.isoformat()}"
+                if window in completed:
+                    counts = WriteCounts(
+                        completed[window].get("inserted", 0),
+                        completed[window].get("updated", 0),
+                    )
+                    previous = results.get(metric.data_type, WriteCounts(0, 0))
+                    results[metric.data_type] = WriteCounts(
+                        previous.inserted + counts.inserted,
+                        previous.updated + counts.updated,
+                    )
+                    succeeded += 1
+                    continue
                 began = monotonic()
                 try:
                     counts = self._save_metric(db, user_id, metric, low, high, granularity)
@@ -111,6 +132,9 @@ class GoogleHealth247Data(Base247DataTemplate):
                     failures[metric.data_type] = str(e)
                     continue
                 succeeded += 1
+                inserted = counts.inserted if counts is not None else 0
+                updated = counts.updated if counts is not None else 0
+                record_checkpoint(window, {"inserted": inserted, "updated": updated})
                 if counts is not None:
                     previous = results.get(metric.data_type, WriteCounts(0, 0))
                     results[metric.data_type] = WriteCounts(
@@ -139,6 +163,11 @@ class GoogleHealth247Data(Base247DataTemplate):
         if start_time < recent_start:
             sleep_windows.append(("sleep_history", start_time, recent_start))
         for data_type, window_start, window_end in sleep_windows:
+            window = f"sleep:{data_type}:{window_start.isoformat()}:{window_end.isoformat()}"
+            if window in completed:
+                sleep_count += completed[window].get("sessions", 0)
+                succeeded += 1
+                continue
             # Sleep merge-saves commit internally, so a savepoint cannot isolate this
             # handler. Use a separate transaction per sleep window.
             try:
@@ -155,6 +184,7 @@ class GoogleHealth247Data(Base247DataTemplate):
                 continue
             sleep_count += count
             succeeded += 1
+            record_checkpoint(window, {"sessions": count})
 
         for metric in METRICS:
             if metric.series_type not in ENERGY_TYPES:

@@ -127,6 +127,12 @@ def create_celery() -> Celery:
     celery_app.autodiscover_tasks(["app.integrations.celery.tasks", "app.integrations.celery.tasks.garmin"])
 
     celery_app.conf.beat_schedule = {
+        "recover-stale-google-history": {
+            "task": "app.integrations.celery.tasks.sync_vendor_data_task.recover_stale_google_history",
+            "schedule": 60.0,
+            "args": (),
+            "kwargs": {},
+        },
         "sync-all-users-periodic": {
             "task": "app.integrations.celery.tasks.periodic_sync_task.sync_all_users",
             "schedule": float(settings.sync_interval_seconds),

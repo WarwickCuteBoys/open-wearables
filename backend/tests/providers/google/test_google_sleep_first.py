@@ -88,6 +88,37 @@ def test_empty_responses_are_not_failures(handler: google.GoogleHealth247Data, s
     sync.failure.assert_not_called()
 
 
+def test_completed_windows_are_skipped_without_rewriting_checkpoints(
+    handler: google.GoogleHealth247Data, sync: MagicMock
+) -> None:
+    start = END - timedelta(days=1)
+    metrics = google.METRICS
+    completed = {
+        f"sleep:sleep_recent:{start.isoformat()}:{END.isoformat()}": {"sessions": 2},
+    }
+    for metric in metrics:
+        for low, high in google.GoogleHealth247Data._recent_windows(start, END):
+            completed[f"metric:{metric.data_type}:{low.isoformat()}:{high.isoformat()}"] = {
+                "inserted": 1,
+                "updated": 2,
+            }
+
+    checkpoint = MagicMock()
+    results = handler.load_and_save_all(
+        sync.db,
+        USER_ID,
+        start,
+        END,
+        completed_windows=completed,
+        checkpoint_window=checkpoint,
+    )
+
+    sync.sleep.assert_not_called()
+    sync.metric.assert_not_called()
+    checkpoint.assert_not_called()
+    assert results == {metric.data_type: WriteCounts(1, 2) for metric in metrics}
+
+
 @pytest.mark.parametrize("failed_window", ["sleep_recent", "sleep_history"])
 def test_sleep_failure_rolls_back_and_preserves_other_work(
     handler: google.GoogleHealth247Data, sync: MagicMock, failed_window: str
