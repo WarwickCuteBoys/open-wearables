@@ -97,6 +97,34 @@ def test_stale_history_delivery_resumes_checkpoints_and_fences_old_attempt() -> 
     assert google_history.finish(user, request.run_id, 1)
 
 
+def test_recover_stale_legacy_request_derives_user_id_from_pending_key() -> None:
+    user_id = uuid4()
+    run_id = "pull_legacy-google-history"
+    legacy_request = {
+        "run_id": run_id,
+        "task_id": str(uuid4()),
+        "requested_at": END.isoformat(),
+        "start_date": (END - timedelta(days=8)).isoformat(),
+        "end_date": END.isoformat(),
+        "days": 8,
+        "start": (END - timedelta(days=8)).timestamp(),
+        "end": END.timestamp(),
+        "expires": 1,
+        "attempt": 0,
+        "phase": "running",
+    }
+    get_redis_client().hset(google_history.pending_key(user_id), run_id, json.dumps(legacy_request))
+
+    recovered, expired = google_history.recover_stale()
+
+    assert expired == []
+    assert len(recovered) == 1
+    assert recovered[0].user_id == str(user_id)
+    assert recovered[0].run_id == run_id
+    assert recovered[0].attempt == 1
+    assert recovered[0].completed_windows == {}
+
+
 def test_wider_or_later_range_never_coalesces_with_narrower() -> None:
     user = uuid4()
     first, _ = google_history.reserve(user, END - timedelta(days=7), END, 7)
