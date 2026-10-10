@@ -15,6 +15,7 @@ from app.schemas.responses.upload import ProviderSyncResult, SyncVendorDataResul
 from app.schemas.sync_status import SyncSource, SyncStage, SyncStatus
 from app.services import google_history
 from app.services.providers.factory import ProviderFactory
+from app.services.summary_warmup import warm_recent_summaries
 from app.services.sync_coordination import (
     GooglePullLease,
     SyncLeaseLostError,
@@ -599,6 +600,7 @@ def sync_vendor_data(
                             )
 
                     result.providers_synced[provider_name] = provider_result
+                    warm_recent_summaries(user_uuid)
                     log_structured(
                         logger,
                         "info",
