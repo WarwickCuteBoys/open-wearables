@@ -1006,13 +1006,11 @@ class Whoop247Data(Base247DataTemplate):
     ) -> tuple[TimeSeriesSampleCreate | None, HealthScoreCreate | None]:
         """Normalize one cycle into a daily energy sample and a daily strain score.
 
-        Returns (None, None) for cycles Whoop has not scored yet, and for the one still
-        in progress. SCORED does not mean final: Whoop scores the ongoing cycle too, and
-        its strain climbs all day. A missing end is what marks it as still running, so
-        both checks are needed — health scores are written with on_conflict_do_nothing,
-        so an early partial value would win permanently over the real one.
+        An in-progress scored cycle contributes its cumulative energy, but not its
+        provisional strain. The energy row is keyed by its cycle start timestamp, so a
+        later sync updates that same row when the cycle closes.
         """
-        if raw_cycle.get("score_state") != "SCORED" or not raw_cycle.get("end"):
+        if raw_cycle.get("score_state") != "SCORED":
             return None, None
 
         score = raw_cycle.get("score") or {}
@@ -1024,12 +1022,30 @@ class Whoop247Data(Base247DataTemplate):
             recorded_at = datetime.fromisoformat(start.replace("Z", "+00:00"))
         except (ValueError, AttributeError):
             return None, None
+        if recorded_at.tzinfo is None:
+            recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+
+        raw_end = raw_cycle.get("end")
+        if raw_end:
+            try:
+                interval_end = datetime.fromisoformat(raw_end.replace("Z", "+00:00"))
+            except (ValueError, AttributeError):
+                return None, None
+            if interval_end.tzinfo is None:
+                interval_end = interval_end.replace(tzinfo=timezone.utc)
+            if interval_end <= recorded_at:
+                return None, None
+        else:
+            interval_end = datetime.now(timezone.utc)
+            if interval_end <= recorded_at:
+                return None, None
 
         zone_offset = raw_cycle.get("timezone_offset")
         kilojoule = score.get("kilojoule")
         strain = score.get("strain")
 
         energy_kcal = kilojoules_to_kcal(kilojoule) if kilojoule is not None else None
+        is_partial = not bool(raw_end)
         energy_sample = None
         if energy_kcal is not None:
             energy_sample = TimeSeriesSampleCreate(
@@ -1040,11 +1056,14 @@ class Whoop247Data(Base247DataTemplate):
                 zone_offset=zone_offset,
                 value=energy_kcal,
                 series_type=SeriesType.energy,
+                interval_end=interval_end,
+                source_type="whoop_cycle_partial" if is_partial else "whoop_cycle_final",
+                coverage_known=True,
                 is_daily_total=True,
             )
 
         strain_score = None
-        if strain is not None:
+        if strain is not None and not is_partial:
             components = {
                 k: ScoreComponent(value=score.get(k))
                 for k in ("average_heart_rate", "max_heart_rate", "kilojoule")

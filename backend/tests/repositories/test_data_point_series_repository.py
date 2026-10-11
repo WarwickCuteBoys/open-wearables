@@ -825,6 +825,52 @@ class TestDataPointSeriesRepository:
 
         assert result[0]["steps_sum"] == 300
 
+    def test_whoop_cycle_final_replaces_partial_energy_row(
+        self, db: Session, series_repo: DataPointSeriesRepository
+    ) -> None:
+        user = UserFactory()
+        start = datetime(2026, 6, 20, tzinfo=timezone.utc)
+        partial = TimeSeriesSampleCreate(
+            id=uuid4(),
+            user_id=user.id,
+            provider="whoop",
+            source="whoop_api",
+            recorded_at=start,
+            interval_end=start + timedelta(hours=12),
+            source_type="whoop_cycle_partial",
+            coverage_known=True,
+            value=1200,
+            series_type=SeriesType.energy,
+            is_daily_total=True,
+        )
+        inserted = series_repo.bulk_create(db, [partial])
+        db.commit()
+
+        final = partial.model_copy(
+            update={
+                "id": uuid4(),
+                "interval_end": start + timedelta(days=1),
+                "source_type": "whoop_cycle_final",
+                "value": 2300,
+            }
+        )
+        updated = series_repo.bulk_create(db, [final])
+        db.commit()
+
+        result = series_repo.get_daily_activity_aggregates(db, user.id, start, start + timedelta(days=1))
+        rows = (
+            db.query(DataPointSeries)
+            .join(DataSource, DataPointSeries.data_source_id == DataSource.id)
+            .filter(DataSource.user_id == user.id)
+            .all()
+        )
+        assert inserted.inserted == 1
+        assert updated.updated == 1
+        assert len(rows) == 1
+        assert result[0]["active_energy_sum"] == 2300
+        assert result[0]["active_energy_source_type"] == "whoop_cycle_final"
+        assert result[0]["active_energy_interval_end"] == start + timedelta(days=1)
+
     def test_aggregate_prefers_daily_per_source(self, db: Session, series_repo: DataPointSeriesRepository) -> None:
         """Prefer-daily is per source: a Garmin daily total and Apple intraday combine across sources."""
         user = UserFactory()

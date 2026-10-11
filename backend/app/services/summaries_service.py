@@ -28,6 +28,7 @@ from app.schemas.enums import (
     infer_device_type_from_model,
 )
 from app.schemas.responses.activity import (
+    ActivityAggregateResult,
     ActivitySummary,
     BloodPressure,
     BodyAveraged,
@@ -41,7 +42,12 @@ from app.schemas.responses.activity import (
     SleepStagesSummary,
     SleepSummary,
 )
-from app.schemas.responses.activity.summaries import EnergyMetadata
+from app.schemas.responses.activity.summaries import (
+    EnergyInterval,
+    EnergyMetadata,
+    EnergyMetricMetadata,
+    EnergyMetricsMetadata,
+)
 from app.schemas.utils import (
     PaginatedResponse,
     Pagination,
@@ -91,6 +97,32 @@ DEFAULT_LATEST_WINDOW_HOURS = 4
 # one row per (date, provider, device) before priority filtering, so this
 # only becomes a real constraint on a multi-year, multi-device date range.
 _SLEEP_JOIN_ROW_LIMIT = 2000
+
+
+def _activity_energy_metadata(result: ActivityAggregateResult, timezone_name: str | None) -> EnergyMetadata:
+    source_type = result.get("active_energy_source_type")
+    start = result.get("active_energy_recorded_at")
+    end = result.get("active_energy_interval_end")
+    if (
+        result.get("provider") != "whoop"
+        or source_type not in {"whoop_cycle_partial", "whoop_cycle_final"}
+        or start is None
+        or end is None
+        or end <= start
+    ):
+        return result.get("energy_metadata") or EnergyMetadata()
+
+    partial = source_type == "whoop_cycle_partial"
+    metadata = EnergyMetricMetadata(
+        coverage="partial" if partial else "complete",
+        estimated=partial,
+        intervals=[EnergyInterval(start=start, end=end)] if partial else [],
+        timezone=timezone_name,
+        as_of=end,
+        reason=("Current WHOOP cycle total is partial." if partial else "WHOOP cycle total is finalized."),
+        source_type=source_type,
+    )
+    return EnergyMetadata(metrics=EnergyMetricsMetadata(active_calories=metadata))
 
 
 class SummariesService:
@@ -754,7 +786,7 @@ class SummariesService:
                 active_calories_kcal=active_cal,
                 total_calories_kcal=total_cal,
                 basal_calories_kcal=basal_cal,
-                energy_metadata=result.get("energy_metadata") or EnergyMetadata(),
+                energy_metadata=_activity_energy_metadata(result, timezone_name),
                 active_minutes=active_mins,
                 sedentary_minutes=sedentary_mins,
                 intensity_minutes=intensity_mins,

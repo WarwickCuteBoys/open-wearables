@@ -27,7 +27,7 @@ Whoop provides access to workout, sleep, recovery, and body measurement data thr
 | Sleep (with stage durations) | Yes — aggregate totals only, no per-stage timestamps |
 | Recovery (score, resting HR, HRV, SpO2, skin temp) | Yes |
 | Body measurements (height, weight) | Yes |
-| Cycle aggregates (daily strain, energy) | Yes — scored cycles only; energy stored as a daily total in kcal |
+| Cycle aggregates (daily strain, energy) | Yes — scored cycles; open-cycle energy is partial, while strain is saved only after the cycle closes |
 | Continuous heart rate / activity samples | No (not available via API) |
 
 ### Workout field availability
@@ -43,6 +43,15 @@ Several workout fields are conditional in the Whoop API and are `null` for most 
 | `avg_pace_sec_per_km` | Derived from distance | Always `null` — see below |
 | `name` | Not provided by Whoop | Always `null` |
 | `source.device` | Not provided by Whoop | Always `null` — workout payloads carry no device identity |
+
+### In-progress cycle energy
+
+Whoop can return a scored cycle before it has an end timestamp. Open Wearables
+saves its cumulative `score.kilojoule` as a daily-total energy sample with
+`source_type: "whoop_cycle_partial"` and an `interval_end` representing when
+the value was fetched. The activity summary marks this as partial and estimated.
+When the cycle closes, the same time-series row is updated as
+`whoop_cycle_final`; provisional strain is not saved before then.
 
 <Note>
   **`distance_meter` and `altitude_gain_meter` are present-but-`null`, not omitted.**
