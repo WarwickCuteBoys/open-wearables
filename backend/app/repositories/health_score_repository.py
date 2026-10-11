@@ -8,7 +8,7 @@ from sqlalchemy.dialects.postgresql import insert
 from app.database import DbSession
 from app.models import DataSource, HealthScore
 from app.repositories.repositories import CrudRepository
-from app.schemas.enums import HealthScoreCategory
+from app.schemas.enums import HealthScoreCategory, ProviderName
 from app.schemas.model_crud.activities import HealthScoreCreate, HealthScoreQueryParams, HealthScoreUpdate
 from app.utils.pagination import decode_cursor
 
@@ -107,6 +107,7 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
         end_date: datetime,
         cursor: str | None,
         limit: int,
+        provider: ProviderName | None = None,
     ) -> list[dict[str, Any]]:
         """Get recovery health scores for a date range with cursor-based pagination.
 
@@ -127,6 +128,8 @@ class HealthScoreRepository(CrudRepository[HealthScore, HealthScoreCreate, Healt
                 HealthScore.recorded_at < end_date,
             )
         )
+        if provider is not None:
+            query = query.filter(HealthScore.provider == provider)
 
         if cursor:
             cursor_ts, cursor_id, direction = decode_cursor(cursor)

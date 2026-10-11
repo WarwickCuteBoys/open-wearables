@@ -317,7 +317,7 @@ class TestGetRecoverySummaries:
             "hrv_rmssd_milli": 63.2,
             "spo2_percentage": 98.4,
         }
-        monkeypatch.setattr(service.health_score_repo, "get_recovery_summaries", lambda *_: [row])
+        monkeypatch.setattr(service.health_score_repo, "get_recovery_summaries", lambda *_args, **_kwargs: [row])
         monkeypatch.setattr(service.event_record_repo, "get_sleep_summaries", lambda *_args, **_kwargs: [])
         monkeypatch.setattr(service, "_filter_by_priority", lambda _db, _uid, results, **_kwargs: results)
 

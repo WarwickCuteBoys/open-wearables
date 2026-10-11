@@ -551,6 +551,7 @@ class EventRecordRepository(
         end_date: datetime,
         cursor: str | None,
         limit: int,
+        provider: ProviderName | None = None,
     ) -> list[dict]:
         """Get daily sleep summaries aggregated by date, source, and device_model.
 
@@ -646,6 +647,7 @@ class EventRecordRepository(
                 EventRecord.end_datetime >= start_date - timedelta(days=1),
                 local_sleep_date >= cast(start_date, Date),
                 local_sleep_date < cast(end_date, Date),
+                *([DataSource.provider == provider] if provider is not None else []),
             )
             .group_by(
                 local_sleep_date,
