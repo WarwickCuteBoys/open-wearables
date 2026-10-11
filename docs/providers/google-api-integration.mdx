@@ -72,6 +72,9 @@ Structured events expose `summary_read` (latency, requested/hit/miss days and
 returned aggregate counts), `summary_query` (SQL execution latency),
 `google_native_fetch` (page count, points and fetch duration), and
 `google_import_stages` (fetch-and-parse, writes, commit and sample count).
+`google_rollup_fetch` exposes the same page/point counts and fetch duration for
+rollup requests, including total calories, so native and aggregated fetches can
+be attributed separately.
 Returned aggregate rows are **not** the raw rows or bytes scanned.
 `summary_volume.matched_samples` counts raw samples admitted by the aggregation
 filters, not rows visited and discarded by the physical query plan. Fetch duration
@@ -82,12 +85,19 @@ query plan to attribute actual disk reads. No sample values or tokens are logged
 ### Progressive historical ingestion
 
 The 24/7 sync fetches total and active energy first, newest windows first, and
-commits each metric window independently. Other time-series requests are also
-bounded to one day, rather than buffering an entire multi-day raw backfill.
-Low-volume heart, body and vital metrics use newest-first windows of up to seven
-days, reducing repeated authenticated requests without dropping samples. Heart
-rate, steps, distance and energy retain daily commits. Retries recognize
-daily checkpoints from an older worker and keep its daily window scheme.
+commits each metric window independently. Time-series requests use bounded
+metric-specific windows rather than buffering an entire raw backfill.
+Steps, distance and low-volume heart, body and vital metrics use newest-first
+windows of up to seven days, reducing repeated authenticated requests without
+dropping raw samples. Heart rate and active energy retain daily commits.
+Hourly total-calorie rollups commit the newest requested day first, then fetch
+older history in windows of up to seven days without changing hourly resolution.
+Calendar total-calories instead split at configured local midnights, fetching
+each intersecting civil day once rather than twice in adjacent sliding windows.
+This preserves local-day boundaries, including 23/25-hour daylight-saving days.
+The current calendar day is still capped at fetch time, and an explicit request
+still re-fetches provider corrections; no persistent response cache is introduced.
+Retries recognize daily checkpoints from an older worker and keep its daily window scheme.
 Provider pagination and rollup range limits still apply inside each window.
 
 Google 24/7 pulls and single-metric webhook fetches reuse one HTTP client for
@@ -101,6 +111,12 @@ the row. Energy ingestion timestamps remain part of the comparison because
 they are used by coverage calculations. `inserted` and `updated` counts report
 actual writes, not unchanged replays. Data-ready notification behavior is
 unchanged, so a consuming app can still catch up on an already-stored batch.
+
+For an eight-day request, steps and distance normally use two windows each
+instead of eight. Hourly total calories also use two windows rather than eight;
+calendar totals intersecting nine civil days use nine requests rather than
+the sixteen requests caused by eight sliding windows. Pagination can add requests,
+and a legacy resumed request retains its original window scheme.
 
 These optimizations retain raw heart-rate resolution. Replacing raw samples
 with minute averages would also change workout averages, daily extrema and

@@ -61,6 +61,7 @@ def test_batched_metric_fetches_twice_and_persists_all_eight_days(monkeypatch: p
 
 
 def test_energy_commits_before_sleep_and_raw_history(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(google.settings, "google_energy_calendar_timezone", None)
     handler = google.GoogleHealth247Data(MagicMock(), MagicMock(), "https://google.invalid")
     handler.settings_repo.get_data_granularity = MagicMock(return_value=DataGranularity.RAW)
     end = datetime(2026, 1, 9, tzinfo=timezone.utc)
@@ -79,7 +80,7 @@ def test_energy_commits_before_sleep_and_raw_history(monkeypatch: pytest.MonkeyP
     def fetch(
         _db: MagicMock, _user: UUID, metric: google.DataTypeMetric, start: datetime, stop: datetime
     ) -> list[MagicMock]:
-        assert stop - start <= timedelta(days=1)
+        assert stop - start <= timedelta(days=7 if metric.series_type == SeriesType.total_energy else 1)
         calls.append(metric.data_type)
         return [MagicMock()]
 
@@ -87,11 +88,13 @@ def test_energy_commits_before_sleep_and_raw_history(monkeypatch: pytest.MonkeyP
     handler._native_samples = fetch
     monkeypatch.setattr(google.timeseries_service, "bulk_create_samples", lambda *_: WriteCounts(1, 2))
     result = handler.load_and_save_all(db, uuid4(), begin, end)
-    assert calls[:16] == ["total-calories", "commit"] * 8
-    assert calls[16:32] == ["active-energy-burned", "commit"] * 8
-    assert calls.index("sleep") > 31
+    assert calls[:4] == ["total-calories", "commit"] * 2
+    assert calls[4:20] == ["active-energy-burned", "commit"] * 8
+    assert calls.index("sleep") > 19
     assert calls.index("heart-rate") > calls.index("sleep")
-    assert all(value.inserted == 8 and value.updated == 16 for value in result.values())
+    assert result["total-calories"] == 6
+    assert result["active-energy-burned"] == 24
+    assert result["heart-rate"] == 24
 
 
 @pytest.mark.parametrize("rollup", [False, True])
@@ -110,6 +113,7 @@ def test_repeated_pagination_is_rejected(monkeypatch: pytest.MonkeyPatch, rollup
 
 
 def test_failed_window_retains_committed_days_and_attempts_older_days(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(google.settings, "google_energy_calendar_timezone", "UTC")
     handler = google.GoogleHealth247Data(MagicMock(), MagicMock(), "https://google.invalid")
     handler.settings_repo.get_data_granularity = MagicMock(return_value=DataGranularity.RAW)
     handler.sleep.load_and_save = MagicMock(return_value=0)

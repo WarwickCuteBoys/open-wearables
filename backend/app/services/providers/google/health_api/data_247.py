@@ -48,8 +48,10 @@ from app.utils.sentry_helpers import log_and_capture_error
 from app.utils.structured_logging import log_structured
 
 ENERGY_TYPES = frozenset({SeriesType.active_energy, SeriesType.total_energy})
-LOW_VOLUME_METRICS = frozenset(
+BATCHED_METRICS = frozenset(
     {
+        "steps",
+        "distance",
         "daily-resting-heart-rate",
         "heart-rate-variability",
         "run-vo2-max",
@@ -269,17 +271,34 @@ class GoogleHealth247Data(Base247DataTemplate):
         end: datetime,
         completed: dict[str, dict[str, int]] | None = None,
     ) -> Iterator[tuple[datetime, datetime]]:
-        # Keep legacy daily checkpoints usable on retries of an existing request.
+        # Calendar splits avoid re-fetching the same civil day in adjacent windows.
         if start > end:
             raise ValueError("start_time must be before or equal to end_time")
         daily_windows = list(GoogleHealth247Data._recent_windows(start, end))
         batch_windows = list(GoogleHealth247Data._recent_windows(start, end, days=7))
+        if metric.series_type == SeriesType.total_energy:
+            if settings.google_energy_calendar_timezone:
+                zone = ZoneInfo(settings.google_energy_calendar_timezone)
+                batch_windows = []
+                cursor = end
+                while cursor > start:
+                    day = (cursor - timedelta(microseconds=1)).astimezone(zone).date()
+                    midnight, _ = day_bounds(day, zone)
+                    low = max(start, midnight)
+                    batch_windows.append((low, cursor))
+                    cursor = low
+            else:
+                recent_start = max(start, end - timedelta(days=1))
+                batch_windows = ([(recent_start, end)] if start < end else []) + list(
+                    GoogleHealth247Data._recent_windows(start, recent_start, days=7)
+                )
         legacy_checkpoint = any(
             f"metric:{metric.data_type}:{low.isoformat()}:{high.isoformat()}" in (completed or {})
             for low, high in daily_windows
             if (low, high) not in batch_windows
         )
-        windows = batch_windows if metric.data_type in LOW_VOLUME_METRICS and not legacy_checkpoint else daily_windows
+        batched = metric.data_type in BATCHED_METRICS or metric.series_type == SeriesType.total_energy
+        windows = batch_windows if batched and not legacy_checkpoint else daily_windows
         yield from windows
 
     @staticmethod
@@ -503,6 +522,8 @@ class GoogleHealth247Data(Base247DataTemplate):
         points: list[dict[str, Any]] = []
         page_token: str | None = None
         seen_tokens: set[str] = set()
+        began = monotonic()
+        page_count = 0
         while True:
             check_google_pull_lease(db)
             body: dict[str, Any] = {
@@ -523,6 +544,7 @@ class GoogleHealth247Data(Base247DataTemplate):
                 method="POST",
                 json_data=body,
             )
+            page_count += 1
             store_raw_payload(
                 source="api_response",
                 provider=self.provider_name,
@@ -539,6 +561,17 @@ class GoogleHealth247Data(Base247DataTemplate):
             if not isinstance(page_token, str) or page_token in seen_tokens:
                 raise ValueError("Invalid or repeated Google pagination token")
             seen_tokens.add(page_token)
+        log_structured(
+            self.logger,
+            "info",
+            "Google rollup pagination",
+            provider="google",
+            event="google_rollup_fetch",
+            endpoint=endpoint,
+            elapsed_ms=round((monotonic() - began) * 1000, 3),
+            pages=page_count,
+            point_count=len(points),
+        )
         return points
 
     @staticmethod

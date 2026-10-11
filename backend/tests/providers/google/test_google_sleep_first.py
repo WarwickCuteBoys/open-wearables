@@ -20,7 +20,7 @@ END = datetime(2026, 9, 8, 5, tzinfo=timezone.utc)
 START = END - timedelta(days=90)
 BOUNDARY = END - timedelta(days=7)
 USER_ID = UUID("00000000-0000-0000-0000-000000000001")
-WINDOWS = list(google.GoogleHealth247Data._recent_windows(START, END))
+WINDOWS = list(google.GoogleHealth247Data._recent_windows(START, END, days=7))
 
 
 @pytest.fixture
