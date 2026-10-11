@@ -1,5 +1,5 @@
 from datetime import date, datetime
-from typing import TypedDict
+from typing import NotRequired, TypedDict
 
 from pydantic import BaseModel
 
@@ -30,6 +30,9 @@ class ActivityAggregateResult(TypedDict):
     device_type: str | None
     steps_sum: int
     active_energy_sum: float | None
+    active_energy_recorded_at: NotRequired[datetime | None]
+    active_energy_interval_end: NotRequired[datetime | None]
+    active_energy_source_type: NotRequired[str | None]
     basal_energy_sum: float | None
     hr_avg: int | None
     hr_max: int | None

@@ -643,6 +643,39 @@ class DataPointSeriesRepository(
                 prefer_daily_sum(steps_id).label("steps_sum"),
                 # Active energy - prefer daily total, else sum samples
                 prefer_daily_sum(energy_id).label("active_energy_sum"),
+                func.max(
+                    case(
+                        (
+                            and_(
+                                self.model.series_type_definition_id == energy_id,
+                                self.model.is_daily_total.is_(True),
+                            ),
+                            self.model.recorded_at,
+                        )
+                    )
+                ).label("active_energy_recorded_at"),
+                func.max(
+                    case(
+                        (
+                            and_(
+                                self.model.series_type_definition_id == energy_id,
+                                self.model.is_daily_total.is_(True),
+                            ),
+                            self.model.interval_end,
+                        )
+                    )
+                ).label("active_energy_interval_end"),
+                func.max(
+                    case(
+                        (
+                            and_(
+                                self.model.series_type_definition_id == energy_id,
+                                self.model.is_daily_total.is_(True),
+                            ),
+                            self.model.source_type,
+                        )
+                    )
+                ).label("active_energy_source_type"),
                 # Basal energy - prefer daily total, else sum samples
                 prefer_daily_sum(basal_energy_id).label("basal_energy_sum"),
                 # Heart rate stats
@@ -709,6 +742,9 @@ class DataPointSeriesRepository(
                     "device_type": row.device_type,
                     "steps_sum": int(row.steps_sum) if row.steps_sum else 0,
                     "active_energy_sum": float(row.active_energy_sum) if row.active_energy_sum is not None else None,
+                    "active_energy_recorded_at": row.active_energy_recorded_at,
+                    "active_energy_interval_end": row.active_energy_interval_end,
+                    "active_energy_source_type": row.active_energy_source_type,
                     "basal_energy_sum": float(row.basal_energy_sum) if row.basal_energy_sum is not None else None,
                     "hr_avg": int(round(float(row.hr_avg))) if row.hr_avg is not None else None,
                     "hr_max": int(row.hr_max) if row.hr_max is not None else None,

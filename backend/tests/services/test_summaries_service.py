@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 from app.schemas.enums import HealthScoreCategory, ProviderName
-from app.services.summaries_service import SummariesService
+from app.services.summaries_service import SummariesService, _activity_energy_metadata
 from tests.factories import (
     DataPointSeriesFactory,
     DataSourceFactory,
@@ -29,6 +29,38 @@ def service() -> SummariesService:
 
 def _dt(iso: str) -> datetime:
     return datetime.fromisoformat(iso)
+
+
+def test_whoop_cycle_energy_metadata_marks_partial_coverage() -> None:
+    metadata = _activity_energy_metadata(
+        {
+            "activity_date": date(2026, 9, 9),
+            "provider": "whoop",
+            "source": "whoop_api",
+            "device_model": None,
+            "device_type": None,
+            "steps_sum": 0,
+            "active_energy_sum": 1200,
+            "active_energy_recorded_at": _dt("2026-09-09T00:00:00+07:00"),
+            "active_energy_interval_end": _dt("2026-09-09T12:00:00+07:00"),
+            "active_energy_source_type": "whoop_cycle_partial",
+            "basal_energy_sum": None,
+            "hr_avg": None,
+            "hr_max": None,
+            "hr_min": None,
+            "distance_sum": None,
+            "flights_climbed_sum": None,
+            "active_time_minutes": None,
+        },
+        "Asia/Bangkok",
+    )
+
+    energy = metadata.metrics.active_calories
+    assert energy.coverage == "partial"
+    assert energy.estimated is True
+    assert energy.source_type == "whoop_cycle_partial"
+    assert energy.as_of == _dt("2026-09-09T12:00:00+07:00")
+    assert len(energy.intervals) == 1
 
 
 # ---------------------------------------------------------------------------
