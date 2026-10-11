@@ -293,12 +293,15 @@ class SummariesService:
         end_date: datetime,
         cursor: str | None,
         limit: int,
+        provider: ProviderName | None = None,
     ) -> PaginatedResponse[SleepSummary]:
         """Get daily sleep summaries aggregated by date, provider, and device."""
         self.logger.debug(f"Fetching sleep summaries for user {user_id} from {start_date} to {end_date}")
 
         # Get aggregated data from repository (now returns list of dicts)
-        results = self.event_record_repo.get_sleep_summaries(db_session, user_id, start_date, end_date, cursor, limit)
+        results = self.event_record_repo.get_sleep_summaries(
+            db_session, user_id, start_date, end_date, cursor, limit, provider=provider
+        )
 
         # Filter by priority to get best source per date
         results = self._filter_by_priority(db_session, user_id, results, date_key="sleep_date")
@@ -423,6 +426,7 @@ class SummariesService:
         user_id: UUID,
         start_date: datetime,
         end_date: datetime,
+        provider: ProviderName | None = None,
     ) -> dict[date, dict]:
         """One sleep aggregate per date, for joining onto recovery summaries.
 
@@ -432,7 +436,13 @@ class SummariesService:
         provider/device per day) is simpler than threading cursors through.
         """
         sleep_results = self.event_record_repo.get_sleep_summaries(
-            db_session, user_id, start_date, end_date, cursor=None, limit=_SLEEP_JOIN_ROW_LIMIT
+            db_session,
+            user_id,
+            start_date,
+            end_date,
+            cursor=None,
+            limit=_SLEEP_JOIN_ROW_LIMIT,
+            provider=provider,
         )
         sleep_results = self._filter_by_priority(db_session, user_id, sleep_results, date_key="sleep_date")
         return {row["sleep_date"]: row for row in sleep_results}
@@ -446,6 +456,7 @@ class SummariesService:
         end_date: datetime,
         cursor: str | None,
         limit: int,
+        provider: ProviderName | None = None,
     ) -> PaginatedResponse[RecoverySummary]:
         """Get daily recovery summaries from HealthScore(RECOVERY) records.
 
@@ -459,7 +470,7 @@ class SummariesService:
         summary, the same aggregation get_sleep_summaries() already does.
         """
         results = self.health_score_repo.get_recovery_summaries(
-            db_session, user_id, start_date, end_date, cursor, limit
+            db_session, user_id, start_date, end_date, cursor, limit, provider=provider
         )
 
         results = self._filter_by_priority(db_session, user_id, results, date_key="recovery_date")
@@ -480,7 +491,11 @@ class SummariesService:
                 first_result = results[0]
                 previous_cursor = encode_cursor(first_result["recorded_at"], first_result["record_id"], "prev")
 
-        sleep_by_date = self._sleep_by_date_for_recovery(db_session, user_id, start_date, end_date) if results else {}
+        sleep_by_date = (
+            self._sleep_by_date_for_recovery(db_session, user_id, start_date, end_date, provider=provider)
+            if results
+            else {}
+        )
 
         data = []
         for r in results:
@@ -533,6 +548,7 @@ class SummariesService:
         limit: int,
         sort_order: str = "asc",
         timezone_name: str | None = None,
+        provider: ProviderName | None = None,
     ) -> PaginatedResponse[ActivitySummary]:
         """Get daily activity summaries aggregated by date, provider, and device.
 
@@ -580,6 +596,13 @@ class SummariesService:
         results = sorted(
             by_key.values(), key=lambda r: (r["activity_date"], r["source"] or "", r.get("device_model") or "")
         )
+
+        if provider is not None:
+            results = [
+                result
+                for result in results
+                if ProviderName.from_source_string(result.get("provider") or result.get("source")) == provider
+            ]
 
         # Filter by priority to get best source per date
         results = self._filter_by_priority(db_session, user_id, results, date_key="activity_date")

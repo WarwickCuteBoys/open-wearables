@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, HTTPException, Query
 
 from app.database import DbSession
+from app.schemas.enums import ProviderName
 from app.schemas.responses.activity import (
     ActivitySummary,
     BodySummary,
@@ -31,6 +32,10 @@ def get_activity_summary(
     limit: Annotated[int, Query(ge=1, le=400)] = 50,
     sort_order: Annotated[str, Query(pattern="^(asc|desc)$")] = "asc",
     timezone: Annotated[str | None, Query(description="IANA local-day timezone, e.g. Asia/Bangkok")] = None,
+    provider: Annotated[
+        ProviderName | None,
+        Query(description="Restrict activity summaries to this provider before source-priority selection"),
+    ] = None,
 ) -> PaginatedResponse[ActivitySummary]:
     """Returns daily aggregated activity metrics.
 
@@ -44,7 +49,15 @@ def get_activity_summary(
         except (ZoneInfoNotFoundError, ValueError) as exc:
             raise HTTPException(status_code=422, detail="timezone must be a valid IANA timezone") from exc
     return summaries_service.get_activity_summaries(
-        db, user_id, start_datetime, end_datetime, cursor, limit, sort_order, timezone_name=timezone
+        db,
+        user_id,
+        start_datetime,
+        end_datetime,
+        cursor,
+        limit,
+        sort_order,
+        timezone_name=timezone,
+        provider=provider,
     )
 
 
@@ -57,11 +70,17 @@ def get_sleep_summary(
     _api_key: ApiKeyDep,
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    provider: Annotated[
+        ProviderName | None,
+        Query(description="Restrict sleep summaries to this provider before source-priority selection"),
+    ] = None,
 ) -> PaginatedResponse[SleepSummary]:
     """Returns daily sleep metrics."""
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_datetime(end_date)
-    return summaries_service.get_sleep_summaries(db, user_id, start_datetime, end_datetime, cursor, limit)
+    return summaries_service.get_sleep_summaries(
+        db, user_id, start_datetime, end_datetime, cursor, limit, provider=provider
+    )
 
 
 @router.get("/users/{user_id}/summaries/recovery")
@@ -73,6 +92,10 @@ def get_recovery_summary(
     _api_key: ApiKeyDep,
     cursor: str | None = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    provider: Annotated[
+        ProviderName | None,
+        Query(description="Restrict recovery summaries to this provider before source-priority selection"),
+    ] = None,
 ) -> PaginatedResponse[RecoverySummary]:
     """Returns daily recovery metrics (recovery score, HRV, resting HR, SpO2).
 
@@ -87,7 +110,9 @@ def get_recovery_summary(
     """
     start_datetime = parse_query_datetime(start_date)
     end_datetime = parse_query_datetime(end_date)
-    return summaries_service.get_recovery_summaries(db, user_id, start_datetime, end_datetime, cursor, limit)
+    return summaries_service.get_recovery_summaries(
+        db, user_id, start_datetime, end_datetime, cursor, limit, provider=provider
+    )
 
 
 @router.get("/users/{user_id}/summaries/body")

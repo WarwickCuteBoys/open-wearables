@@ -373,6 +373,13 @@ coverage, not a claim about the user's local day. An invalid timezone returns 42
 Archived non-energy daily buckets retain their original dates because their
 original intervals have already been discarded.
 
+The optional **`provider`** query parameter filters activity rows to a single
+provider before the user's source-priority rule is applied. Use it when importing
+or comparing one provider at a time; without it, the endpoint continues to return
+the globally preferred source for each day. For example, `provider=whoop` returns
+WHOOP summaries even when another connected provider has higher daily priority.
+The sleep and recovery summary endpoints accept the same `provider` parameter.
+
 The existing nullable fields `active_calories_kcal` and `total_calories_kcal`
 remain. `basal_calories_kcal` is additive and nullable. The following metadata
 object is additive on every activity summary:

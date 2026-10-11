@@ -55,6 +55,39 @@ class TestSleepSummaryEndpoint:
         assert data["data"][0]["end_time"] == "2025-12-26T05:00:00Z"
         assert data["data"][0]["duration_minutes"] == 420  # 7 hours
 
+    def test_get_sleep_summary_can_filter_to_provider(self, client: TestClient, db: Session) -> None:
+        """Provider-specific sleep reads keep a source hidden by daily priority."""
+        user = UserFactory()
+        whoop = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source=ProviderName.WHOOP)
+        google = DataSourceFactory(user=user, provider=ProviderName.GOOGLE, source=ProviderName.GOOGLE)
+        for mapping, start_hour in ((whoop, 22), (google, 23)):
+            sleep_start = datetime(2025, 12, 25, start_hour, 0, 0, tzinfo=timezone.utc)
+            sleep_end = datetime(2025, 12, 26, 5, 0, 0, tzinfo=timezone.utc)
+            EventRecordFactory(
+                mapping=mapping,
+                category="sleep",
+                start_datetime=sleep_start,
+                end_datetime=sleep_end,
+                duration_seconds=int(sleep_end.timestamp() - sleep_start.timestamp()),
+            )
+        api_key = ApiKeyFactory()
+
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/sleep",
+            headers=api_key_headers(api_key.id),
+            params={
+                "start_date": "2025-12-25T00:00:00Z",
+                "end_date": "2025-12-27T00:00:00Z",
+                "provider": "whoop",
+            },
+        )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        assert data[0]["source"]["provider"] == "whoop"
+        assert data[0]["duration_minutes"] == 420
+
     def test_get_sleep_summary_with_details(self, client: TestClient, db: Session) -> None:
         """Test sleep summary returns sleep stage details and efficiency."""
         user = UserFactory()
@@ -489,6 +522,44 @@ class TestActivitySummaryEndpoint:
         activity = data["data"][0]
         assert activity["active_calories_kcal"] == 400.5  # 250.5 + 150.0
         assert activity["total_calories_kcal"] == 2000.5  # 400.5 + 1600.0
+
+    def test_get_activity_summary_can_filter_to_provider_before_priority_selection(
+        self, client: TestClient, db: Session
+    ) -> None:
+        """Provider-specific reads retain a source hidden by global daily priority."""
+        user = UserFactory()
+        whoop = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source=ProviderName.WHOOP)
+        google = DataSourceFactory(user=user, provider=ProviderName.GOOGLE, source=ProviderName.GOOGLE)
+        energy_type = SeriesTypeDefinitionFactory.get_or_create_energy()
+        recorded_at = datetime(2025, 12, 26, 10, 0, 0, tzinfo=timezone.utc)
+        DataPointSeriesFactory(
+            mapping=whoop,
+            series_type=energy_type,
+            value=Decimal("1200"),
+            recorded_at=recorded_at,
+        )
+        DataPointSeriesFactory(
+            mapping=google,
+            series_type=energy_type,
+            value=Decimal("450"),
+            recorded_at=recorded_at,
+        )
+
+        api_key = ApiKeyFactory()
+        response = client.get(
+            f"/api/v1/users/{user.id}/summaries/activity",
+            headers=api_key_headers(api_key.id),
+            params={
+                "start_date": "2025-12-25T00:00:00Z",
+                "end_date": "2025-12-27T00:00:00Z",
+                "provider": "whoop",
+            },
+        )
+
+        assert response.status_code == 200
+        activity = response.json()["data"][0]
+        assert activity["active_calories_kcal"] == 1200
+        assert activity["source"]["provider"] == "whoop"
 
     def test_get_activity_summary_with_heart_rate(self, client: TestClient, db: Session) -> None:
         """Test activity summary includes heart rate statistics."""
@@ -1464,6 +1535,35 @@ class TestRecoverySummaryEndpoint:
 
     def _url(self, user_id: object) -> str:
         return f"/api/v1/users/{user_id}/summaries/recovery"
+
+    def test_can_filter_to_provider(self, client: TestClient, db: Session) -> None:
+        """Provider-specific recovery reads only return that provider's scores."""
+        user = UserFactory()
+        whoop = DataSourceFactory(user=user, provider=ProviderName.WHOOP, source=ProviderName.WHOOP)
+        oura = DataSourceFactory(user=user, provider=ProviderName.OURA, source=ProviderName.OURA)
+        recorded_at = datetime(2025, 12, 26, 0, 0, 0, tzinfo=timezone.utc)
+        for source, provider, value in ((whoop, ProviderName.WHOOP, "78"), (oura, ProviderName.OURA, "64")):
+            HealthScoreFactory(
+                data_source=source,
+                category=HealthScoreCategory.RECOVERY,
+                value=Decimal(value),
+                provider=provider,
+                recorded_at=recorded_at,
+                components=None,
+            )
+        api_key = ApiKeyFactory()
+
+        response = client.get(
+            self._url(user.id),
+            headers=api_key_headers(api_key.id),
+            params={**self.BASE_PARAMS, "provider": "whoop"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()["data"]
+        assert len(data) == 1
+        assert data[0]["recovery_score"] == 78
+        assert data[0]["source"]["provider"] == "whoop"
 
     def test_returns_200_with_recovery_score(self, client: TestClient, db: Session) -> None:
         """Basic recovery record is returned with correct score and date."""
